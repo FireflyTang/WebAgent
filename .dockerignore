@@ -1,0 +1,12 @@
+**
+
+# The worker image copies only these build inputs. Keeping the context as an
+# allowlist prevents credentials, local state, dependencies, and release
+# artifacts from ever reaching the Docker daemon.
+!Dockerfile.worker
+!ops/
+!ops/worker_exec.py
+!src/
+!src/app/
+!src/app/runtime/
+!src/app/runtime/agent_sdk_runner.py

@@ -1,0 +1,21 @@
+.env*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+data/
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# Local demo captures and handoff bundles (curated images belong in docs/assets/).
+/1.png
+/2.png
+/3.png
+/4.png
+/sandbox-coding-agent-handoff-v4.zip

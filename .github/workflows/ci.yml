@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Install dependencies
+        run: uv sync --locked --dev
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Test (no Docker integration)
+        run: uv run pytest -m "not integration" --ignore=tests/browser
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+      - name: Check formatting
+        run: npm run format:check
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Verify committed frontend bundle
+        run: git -C .. diff --exit-code -- src/app/web
+
+  package:
+    name: Build and verify wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build wheel
+        run: uv build --wheel
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv --python 3.11 .wheel-venv
+          uv pip install --python .wheel-venv/bin/python --no-cache dist/*.whl
+      - name: Verify installed app and bundled web assets
+        run: |
+          .wheel-venv/bin/python - <<'PY'
+          from importlib.metadata import requires
+          from importlib.resources import files
+          from app.main import app
+
+          package_root = files("app")
+          web_root = package_root.joinpath("web")
+          assets = [item for item in web_root.joinpath("assets").iterdir() if item.is_file()]
+          assert "site-packages" in str(package_root), package_root
+          assert any(req.lower().startswith("httpx") for req in (requires("WebAgent") or []))
+          assert app is not None
+          assert web_root.joinpath("index.html").is_file()
+          assert any(item.name.endswith(".js") for item in assets), assets
+          assert any(item.name.endswith(".css") for item in assets), assets
+          print(f"installed {app.title}; verified {len(assets)} bundled assets")
+          PY
+
+  browser:
+    name: Browser tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --locked --dev
+      - name: Install browser engines and system dependencies
+        run: uv run playwright install --with-deps chromium webkit
+      - name: Run browser tests
+        run: uv run pytest tests/browser
+
+  docker-integration:
+    name: Docker integration tests
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --locked --dev
+      - name: Build sandbox worker image
+        run: docker build -t webagent-worker:latest -f Dockerfile.worker .
+      - name: Run Docker integration tests
+        run: uv run pytest -m integration tests/integration

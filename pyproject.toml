@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "WebAgent"
+version = "0.3.0"
+description = "A local-first web workspace for running coding agents in persistent sandboxes"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+keywords = ["ai-agent", "coding-agent", "fastapi", "sandbox", "websocket"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: User Interfaces",
+]
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "httpx>=0.27,<1.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.4,<3.0",
+    "python-multipart>=0.0.9,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+]
+
+[dependency-groups]
+dev = [
+    "claude-agent-sdk==0.2.135",
+    "playwright>=1.50,<2.0",
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23,<1.0",
+    "ruff>=0.16,<1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["integration: 需要本机 Docker 与已构建 worker 镜像的集成测试"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+ignore = [
+    "B008",   # FastAPI dependency declarations intentionally call Depends.
+    "E501",   # Ruff's formatter owns line wrapping.
+    "RUF001", # Chinese Demo text intentionally uses full-width punctuation.
+    "RUF005", # Tuple concatenation is clearer in the SQLite update path.
+    "UP042",  # str + Enum keeps the domain type explicit and portable.
+]
