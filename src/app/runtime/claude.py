@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
-from .base import ProviderConfig, RuntimeContext
+from .base import RuntimeContext
 from .events import Completed, Failed, RuntimeEvent, TextDelta, Usage
 
 CliLine: TypeAlias = str | bytes
@@ -38,30 +38,14 @@ class ClaudeCodeRuntime:
     executor instead.
     """
 
-    _allowed_auth_envs = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
-    _openai_compat_model = "claude-code-agent"
-
     def __init__(
         self,
-        api_key: str,
         *,
-        base_url: str | None = None,
-        model: str | None = None,
-        auth_env: str = "ANTHROPIC_API_KEY",
         claude_command: str = "claude",
         executor: ClaudeCliExecutor | None = None,
     ) -> None:
-        if not api_key:
-            raise ValueError("A Claude API credential is required")
-        if auth_env not in self._allowed_auth_envs:
-            allowed = ", ".join(sorted(self._allowed_auth_envs))
-            raise ValueError(f"auth_env must be one of: {allowed}")
         if not claude_command:
             raise ValueError("claude_command must not be empty")
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/") if base_url else None
-        self.model = model
-        self.auth_env = auth_env
         self.claude_command = claude_command
         self.executor = executor or self._subprocess_executor
         self._states: dict[str, str] = {}
@@ -89,11 +73,9 @@ class ClaudeCodeRuntime:
             "NODE_EXTRA_CA_CERTS",
         )
         env = {name: os.environ[name] for name in inherited if os.environ.get(name)}
-        provider = context.provider or ProviderConfig(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            auth_env=self.auth_env,
-        )
+        provider = context.provider
+        if provider is None:
+            raise RuntimeError("A provider API credential is required")
         if not provider.api_key:
             raise RuntimeError("A provider API credential is required")
         env[provider.auth_env] = provider.api_key
@@ -120,9 +102,8 @@ class ClaudeCodeRuntime:
             "--verbose",
             "--dangerously-skip-permissions",
         ]
-        model = self._model_for(context)
-        if model:
-            command.extend(["--model", model])
+        if context.model:
+            command.extend(["--model", context.model])
         if context.system_prompt:
             command.extend(["--system-prompt", context.system_prompt])
         if resume:
@@ -133,12 +114,6 @@ class ClaudeCodeRuntime:
             command.extend(["--session-id", runtime_session_id])
         command.append(message)
         return command
-
-    def _model_for(self, context: RuntimeContext) -> str | None:
-        """Keep the stable OpenAI-facing model alias out of provider CLI args."""
-        if context.model and context.model != self._openai_compat_model:
-            return context.model
-        return self.model
 
     async def create_session(self, context: RuntimeContext) -> str:
         context.workspace.mkdir(parents=True, exist_ok=True)

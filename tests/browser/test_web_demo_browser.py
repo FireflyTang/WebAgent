@@ -59,7 +59,7 @@ def web_server(tmp_path: Path):
             payload = json.dumps(
                 {
                     "data": [
-                        {"id": "claude-code-agent"},
+                        {"id": "test-model"},
                         {"id": "browser-fake-model"},
                         {"id": "keyboard-model"},
                     ]
@@ -83,14 +83,12 @@ def web_server(tmp_path: Path):
             "PYTHONPATH": str(Path.cwd() / "src"),
             "HOST": "0.0.0.0",
             "PORT": str(port),
-            "API_KEY": "browser-demo-key",
             "RUNTIME_BACKEND": "fake",
             "SANDBOX_BACKEND": "local",
             "DATABASE_URL": f"sqlite:///{tmp_path / 'browser.db'}",
             "WORKSPACE_ROOT": str(tmp_path / "workspaces"),
             "FAKE_STREAM_DELAY_MS": "0",
             "FAKE_LONG_TASK_DELAY_MS": "0",
-            "CLAUDE_AVAILABLE_MODELS": "claude-code-agent,browser-fake-model,keyboard-model",
         }
     )
     process = subprocess.Popen(
@@ -1844,7 +1842,7 @@ def test_deleted_sessions_are_hidden_and_never_restored_as_active_selection(
             (created["incompatibleId"],),
         ).fetchone()
         metadata = json.loads(row[0])
-        metadata["runtime_backend"] = "ZhipuRuntime"
+        metadata["runtime_backend"] = "LegacyRuntime"
         database.execute(
             "UPDATE sessions SET metadata_json = ? WHERE session_id = ?",
             (json.dumps(metadata), created["incompatibleId"]),

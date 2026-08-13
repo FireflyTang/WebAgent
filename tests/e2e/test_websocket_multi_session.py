@@ -165,7 +165,6 @@ def test_disconnect_keeps_its_background_turn_and_other_session_completes(
     environment.update(
         {
             "PYTHONPATH": str(Path.cwd() / "src"),
-            "API_KEY": "unused-by-websocket",
             "RUNTIME_BACKEND": "fake",
             "SANDBOX_BACKEND": "local",
             "DATABASE_URL": f"sqlite:///{tmp_path / 'sessions.db'}",

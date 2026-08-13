@@ -10,10 +10,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import chat_completions, health, models, sessions, web
+from app.api import health, sessions, web
 from app.config import Settings, get_settings
 from app.runtime import AgentSDKRuntime, ClaudeCodeRuntime, FakeRuntime
-from app.runtime.model_catalog import ModelCatalog
 from app.sandbox import DockerSandboxManager, LocalSandboxManager
 from app.sessions import SessionLockRegistry, SQLiteSessionRepository
 from app.sessions.html_log import SessionHtmlLogger
@@ -84,39 +83,19 @@ def _docker_claude_executor(sandbox: DockerSandboxManager, timeout_seconds: int)
 def _runtime(settings: Settings, sandbox):
     if settings.runtime_backend == "fake":
         return FakeRuntime(settings.fake_stream_delay_ms, settings.fake_long_task_delay_ms)
-    if settings.runtime_backend == "zhipu":
-        if not settings.zhipu_api_key:
-            raise RuntimeError("ZHIPU_API_KEY is required when RUNTIME_BACKEND=zhipu")
-        from app.runtime.zhipu import ZhipuRuntime
-
-        return ZhipuRuntime(
-            api_key=settings.zhipu_api_key,
-            model=settings.zhipu_model,
-            endpoint=settings.zhipu_base_url.rstrip("/") + "/chat/completions",
-        )
     if settings.runtime_backend == "claude":
         if not isinstance(sandbox, DockerSandboxManager):
             raise RuntimeError("RUNTIME_BACKEND=claude requires SANDBOX_BACKEND=docker")
         executor = _docker_claude_executor(sandbox, settings.claude_timeout_seconds)
         return AgentSDKRuntime(
-            api_key=settings.claude_api_key,
-            base_url=settings.claude_base_url,
-            model=settings.claude_model,
-            auth_env=settings.claude_auth_env,
             runner_command=settings.claude_sdk_runner,
             executor=executor,
         )
     if settings.runtime_backend == "claude-cli":
-        if not settings.claude_api_key:
-            raise RuntimeError("CLAUDE_API_KEY is required when RUNTIME_BACKEND=claude-cli")
         if not isinstance(sandbox, DockerSandboxManager):
             raise RuntimeError("RUNTIME_BACKEND=claude-cli requires SANDBOX_BACKEND=docker")
         executor = _docker_claude_executor(sandbox, settings.claude_timeout_seconds)
         return ClaudeCodeRuntime(
-            api_key=settings.claude_api_key,
-            base_url=settings.claude_base_url,
-            model=settings.claude_model,
-            auth_env=settings.claude_auth_env,
             claude_command=settings.claude_command,
             executor=executor,
         )
@@ -135,15 +114,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         active_turns = ActiveTurnRegistry(ui_event_journal)
         sandbox = _sandbox(configured)
         runtime = _runtime(configured, sandbox)
-        model_catalog = None
-        if configured.runtime_backend in {"claude", "claude-cli"}:
-            model_catalog = ModelCatalog(
-                api_key=configured.claude_api_key or "",
-                base_url=configured.claude_base_url,
-                auth_env=configured.claude_auth_env,
-                fallback_models=configured.model_catalog_fallback_models,
-                cache_seconds=configured.model_catalog_cache_seconds,
-            )
         session_logger = SessionHtmlLogger(repository)
         service = SessionService(
             repository,
@@ -168,10 +138,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.active_turns = active_turns
         app.state.sandbox_manager = sandbox
         app.state.runtime = runtime
-        app.state.model_catalog = model_catalog
         app.state.session_service = service
         app.state.session_logger = session_logger
-        app.state.chat_completion_handler = service
 
         async def health_check() -> dict[str, str]:
             return {
@@ -198,8 +166,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             close = getattr(runtime, "aclose", None)
             if close is not None:
                 await close()
-            if model_catalog is not None:
-                await model_catalog.aclose()
 
     app = FastAPI(title="WebAgent", version="0.3.0", lifespan=lifespan)
 
@@ -217,26 +183,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code = 503
         return JSONResponse(
             status_code=status_code,
-            content={
-                "error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}
-            },
+            content={"error": {"message": str(exc), "code": exc.code}},
         )
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(_: Request, exc: HTTPException) -> JSONResponse:
-        if isinstance(exc.detail, dict) and "error" in exc.detail:
-            content = exc.detail
-        else:
-            error_type = (
-                "authentication_error" if exc.status_code == 401 else "invalid_request_error"
-            )
-            content = {
-                "error": {
-                    "message": str(exc.detail),
-                    "type": error_type,
-                    "code": "http_error",
-                }
-            }
+        content = {"error": {"message": str(exc.detail), "code": "http_error"}}
         return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
     @app.exception_handler(RequestValidationError)
@@ -247,15 +199,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={
                 "error": {
                     "message": "; ".join(messages),
-                    "type": "invalid_request_error",
                     "code": "invalid_request",
                 }
             },
         )
 
     app.include_router(health.router)
-    app.include_router(models.router)
-    app.include_router(chat_completions.router)
     app.include_router(sessions.router)
     app.include_router(web.router)
     app.mount("/static", StaticFiles(directory=web.web_root), name="static")

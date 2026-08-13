@@ -2,6 +2,13 @@
 
 本文件从开发日志中蒸馏用户可见变化，不保留机器地址、Endpoint、PID、临时 Session、旧测试数字或调试流水。
 
+## Unreleased
+
+### Breaking changes
+
+- 移除外部 OpenAI-compatible `/v1/chat/completions` 与 `/v1/models`、共享 Bearer API key、SSE/curl smoke，以及 Zhipu legacy runtime。
+- 仓库现专注浏览器 WebAgent 路线；浏览器 Provider 目录 `/v1/web/models` 保留，Provider 配置仅随每个 Web turn 提交。
+
 ## 0.3.0 — 2026-08-11
 
 ### Added
@@ -21,7 +28,7 @@
 - 项目统一命名 WebAgent，版本统一为 0.3.0，并明确 unofficial/local-demo 定位。
 - WebSocket 从任务所有者改为可断开的 Session 订阅；应用 shutdown 成为运行任务的最终边界。
 - 真实 runtime 从 CLI 主路径迁移到 SDK；CLI 保留为显式 fallback。
-- Provider 配置从服务端唯一默认改为 Web turn 客户端上下文；curl 仍可使用部署级默认。
+- Provider 配置由 Web turn 作为客户端上下文提交。
 - 诊断事件由独立 HTML 文件迁移到 SQLite，读取时动态生成页面。
 - 默认监听收紧为 `127.0.0.1`。
 

@@ -35,16 +35,31 @@ async def collect(runtime: AgentSDKRuntime, runtime_id: str, context: RuntimeCon
     return [event async for event in runtime.send_message(runtime_id, "do work", context)]
 
 
+def provider_context(tmp_path: Path, **kwargs) -> RuntimeContext:
+    provider = kwargs.pop("provider", ProviderConfig(api_key="test-key"))
+    return RuntimeContext(
+        "external",
+        "sandbox",
+        tmp_path,
+        provider=provider,
+        **kwargs,
+    )
+
+
 @pytest.mark.asyncio
 async def test_sdk_runtime_runs_only_in_injected_executor_and_resumes(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "host-subscription-token")
     executor = RecordingExecutor([json.dumps({"type": "completed"})])
-    runtime = AgentSDKRuntime(
-        "test-key", base_url="https://gateway.example/", model="glm-4.7", executor=executor
+    runtime = AgentSDKRuntime(executor=executor)
+    context = provider_context(
+        tmp_path,
+        system_prompt="be concise",
+        model="glm-4.7",
+        effort="medium",
+        provider=ProviderConfig(base_url="https://gateway.example/", api_key="test-key"),
     )
-    context = RuntimeContext("external", "sandbox", tmp_path, "be concise", effort="medium")
     runtime_id = await runtime.create_session(context)
     await runtime.resume(runtime_id, context)
 
@@ -99,8 +114,8 @@ async def test_sdk_runtime_maps_runner_events_without_raw_provider_data(tmp_path
             json.dumps({"type": "completed", "stop_reason": "end_turn"}),
         ]
     )
-    runtime = AgentSDKRuntime("key", executor=executor)
-    context = RuntimeContext("external", "sandbox", tmp_path)
+    runtime = AgentSDKRuntime(executor=executor)
+    context = provider_context(tmp_path)
     runtime_id = await runtime.create_session(context)
 
     events = await collect(runtime, runtime_id, context)
@@ -128,8 +143,8 @@ async def test_sdk_runtime_hides_runner_failure_details_and_handles_lifecycle(
     executor = RecordingExecutor(
         [json.dumps({"type": "failed", "code": "internal", "message": "tool input secret"})]
     )
-    runtime = AgentSDKRuntime("key", executor=executor)
-    context = RuntimeContext("external", "sandbox", tmp_path)
+    runtime = AgentSDKRuntime(executor=executor)
+    context = provider_context(tmp_path)
     runtime_id = await runtime.create_session(context)
     events = await collect(runtime, runtime_id, context)
     assert isinstance(events[0], Failed)
@@ -154,8 +169,8 @@ async def test_sdk_runtime_closes_executor_iterator_after_terminal_failure(tmp_p
         finally:
             closed = True
 
-    runtime = AgentSDKRuntime("key", executor=executor)
-    context = RuntimeContext("external", "sandbox", tmp_path)
+    runtime = AgentSDKRuntime(executor=executor)
+    context = provider_context(tmp_path)
     runtime_id = await runtime.create_session(context)
     events = await collect(runtime, runtime_id, context)
 
@@ -163,15 +178,10 @@ async def test_sdk_runtime_closes_executor_iterator_after_terminal_failure(tmp_p
     assert closed is True
 
 
-def test_sdk_runtime_rejects_unapproved_auth_environment() -> None:
-    with pytest.raises(ValueError, match="auth_env"):
-        AgentSDKRuntime("key", auth_env="CLAUDE_CODE_OAUTH_TOKEN", executor=RecordingExecutor())
-
-
 @pytest.mark.asyncio
-async def test_sdk_runtime_uses_and_overrides_per_turn_provider_context(tmp_path: Path) -> None:
+async def test_sdk_runtime_uses_per_turn_provider_context(tmp_path: Path) -> None:
     executor = RecordingExecutor([json.dumps({"type": "completed"})])
-    runtime = AgentSDKRuntime(None, executor=executor)
+    runtime = AgentSDKRuntime(executor=executor)
     first = RuntimeContext(
         "external",
         "sandbox",
@@ -211,7 +221,7 @@ async def test_sdk_runtime_uses_and_overrides_per_turn_provider_context(tmp_path
 async def test_sdk_runtime_without_settings_or_turn_credential_fails_clearly(
     tmp_path: Path,
 ) -> None:
-    runtime = AgentSDKRuntime(None, executor=RecordingExecutor())
+    runtime = AgentSDKRuntime(executor=RecordingExecutor())
     context = RuntimeContext("external", "sandbox", tmp_path)
     runtime_id = await runtime.create_session(context)
 
@@ -221,11 +231,10 @@ async def test_sdk_runtime_without_settings_or_turn_credential_fails_clearly(
     assert events[0].code == "provider_credentials_missing"
 
 
-def test_claude_backend_can_start_without_a_server_provider_key(tmp_path: Path) -> None:
+def test_claude_backend_starts_without_a_server_provider_key(tmp_path: Path) -> None:
     runtime = _runtime(
-        Settings(runtime_backend="claude", sandbox_backend="docker", claude_api_key=None),
+        Settings(runtime_backend="claude", sandbox_backend="docker"),
         DockerSandboxManager(tmp_path / "workspaces", docker_binary="missing-docker"),
     )
 
     assert isinstance(runtime, AgentSDKRuntime)
-    assert runtime.api_key is None

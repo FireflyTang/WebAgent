@@ -8,7 +8,6 @@
 flowchart TB
     Browser[React Web UI] -->|REST| FastAPI[FastAPI application]
     Browser <-->|per-session WebSocket| Registry[ActiveTurnRegistry]
-    Client[OpenAI-compatible client] -->|HTTP + SSE| FastAPI
     FastAPI --> Service[SessionService]
     Registry --> Service
     Service --> Runtime[Fake / Agent SDK / CLI fallback]
@@ -20,7 +19,7 @@ flowchart TB
     Repo --> Browser
 ```
 
-REST 负责 Session、Transcript、history、文件、诊断日志和 Provider model discovery。WebSocket 负责某个 Session 的 UI event 订阅、发起 web turn、ping 与 stop。OpenAI-compatible API 走独立的 Chat Completions/SSE 契约。
+REST 负责 Session、Transcript、history、文件、诊断日志和 Provider model discovery。WebSocket 负责某个 Session 的 UI event 订阅、发起 web turn、ping 与 stop。
 
 ## Session 与 workspace
 
@@ -76,7 +75,7 @@ Journal 不是持久任务队列。进程崩溃可能丢失尚未写入 SQLite �
 
 Web UI 把 Endpoint、API Key 与认证方式保存在浏览器，先调用 `/v1/web/models` 验证动态目录，再选择默认模型/effort并保存。每个 message 携带 Provider 配置快照；服务端按 turn 使用，不把配置或 Key 写入 Session metadata、Transcript 或 diagnostic SQLite。Provider 目录失败的 server warning 会使用脱敏 Endpoint、认证方式和 Key 短 hash fingerprint。模型目录只把 ID 视为稳定事实。
 
-Fake curl 路径无需 Provider。真实 Web UI 必须提供客户端 Provider。OpenAI-compatible API 可以使用服务端 `CLAUDE_*` 默认值，这两类 Key 与权限边界互不等同。
+Web UI 必须提供客户端 Provider。服务端按当前 turn 使用该配置，不将其转为部署级默认值。
 
 ## 三层历史
 

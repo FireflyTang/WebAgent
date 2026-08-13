@@ -8,15 +8,11 @@
 
 ## D-002 — 保留确定性 FakeRuntime（Accepted）
 
-FakeRuntime 不依赖网络、Provider 或模型波动，可验证 session、SSE、文件、测试与生命周期的精确纵向切片。它不是“假的 UI”；除模型推理外仍走真实应用路径。
-
-## D-003 — curl 是唯一验收客户端（Superseded）
-
-早期以 curl 为唯一阻塞门禁。现由 curl smoke、协议测试、真实 Chromium、Docker integration 和 Python 全套共同验收。curl 仍是无 Provider 快速体验与 OpenAI-compatible 合同测试入口。
+FakeRuntime 不依赖网络、Provider 或模型波动，可验证 session、文件、测试与生命周期的精确纵向切片。它不是“假的 UI”；除模型推理外仍走真实应用路径。
 
 ## D-004 — Provider 与执行器分离（Accepted）
 
-Claude Agent SDK/CLI、Docker、Session 和事件协议是固定层；Anthropic-compatible Endpoint、Key、认证方式、模型 ID 与 effort 是可替换上下文。Web UI 必须先测试客户端 Provider，再选择默认 model/effort 并保存；curl 可使用部署级默认配置。
+Claude Agent SDK/CLI、Docker、Session 和事件协议是固定层；Anthropic-compatible Endpoint、Key、认证方式、模型 ID 与 effort 是可替换上下文。Web UI 必须先测试客户端 Provider，再选择默认 model/effort 并保存。
 
 模型目录只展示动态 ID，不硬编码描述、能力、价格或推荐。
 

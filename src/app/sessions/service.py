@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TypeVar
 
-from app.openai_compat.schemas import ChatCompletionRequest
 from app.runtime import (
     AgentRuntime,
     Completed,
@@ -28,7 +27,7 @@ from app.sandbox import SandboxManager
 
 from .html_log import SessionHtmlLogger
 from .locks import SessionLockRegistry
-from .models import SessionRecord, SessionState, utc_now
+from .models import SessionRecord, SessionState, SessionTurnRequest, utc_now
 from .repository import SessionLogEntry, SessionRepository, SessionVersionConflictError
 from .runtime_debug import append_runtime_debug
 from .state_machine import touch, transition
@@ -74,46 +73,6 @@ class _SessionEventLease(AsyncIterator[T]):
         finally:
             if self._lock.locked():
                 self._lock.release()
-
-    async def aclose(self) -> None:
-        async with self._operation_lock:
-            await self._close_unlocked()
-
-
-class _TextOnlyEventIterator(AsyncIterator[str]):
-    """Project text deltas while retaining explicit ownership of the event lease."""
-
-    def __init__(self, events: AsyncIterator[TextDelta | object]) -> None:
-        self._events = events
-        self._closed = False
-        self._operation_lock = asyncio.Lock()
-
-    def __aiter__(self) -> _TextOnlyEventIterator:
-        return self
-
-    async def __anext__(self) -> str:
-        async with self._operation_lock:
-            if self._closed:
-                raise StopAsyncIteration
-            try:
-                while True:
-                    event = await anext(self._events)
-                    if isinstance(event, TextDelta):
-                        return event.text
-            except BaseException:
-                await self._close_unlocked()
-                raise
-
-    async def _close_unlocked(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._events.aclose()
-        except AttributeError:
-            # AsyncIterator's protocol does not declare aclose, but all event
-            # streams constructed by SessionService are explicit leases.
-            return
 
     async def aclose(self) -> None:
         async with self._operation_lock:
@@ -279,16 +238,6 @@ class SessionService:
             return await operation
         except Exception as exc:
             raise SandboxUnavailableError("Sandbox backend is unavailable") from exc
-
-    @staticmethod
-    def _inputs(request: ChatCompletionRequest) -> tuple[str, str | None]:
-        user = next(
-            message.content for message in reversed(request.messages) if message.role == "user"
-        )
-        system = next(
-            (message.content for message in request.messages if message.role == "system"), None
-        )
-        return user, system
 
     async def _create(
         self,
@@ -542,7 +491,7 @@ class SessionService:
 
     async def _run_turn_events(
         self,
-        request: ChatCompletionRequest,
+        request: SessionTurnRequest,
         session_id: str,
         provider: ProviderConfig | None = None,
         effort: Effort | None = None,
@@ -558,7 +507,8 @@ class SessionService:
         finalizing_started_at: float | None = None
         preparing_started_at: float | None = None
         started_at = time.monotonic()
-        message, system_prompt = self._inputs(request)
+        message = request.message
+        system_prompt = request.system_prompt
         try:
             await self._append_log(
                 session_id,
@@ -690,7 +640,7 @@ class SessionService:
 
     async def stream_events(
         self,
-        request: ChatCompletionRequest,
+        request: SessionTurnRequest,
         session_id: str,
         *,
         provider: ProviderConfig | None = None,
@@ -703,26 +653,6 @@ class SessionService:
         await lock.acquire()
         inner = self._run_turn_events(request, session_id, provider, effort)
         return _SessionEventLease(inner, lock)
-
-    async def stream(
-        self,
-        request: ChatCompletionRequest,
-        session_id: str,
-        *,
-        provider: ProviderConfig | None = None,
-    ) -> AsyncIterator[str]:
-        events = await self.stream_events(request, session_id, provider=provider)
-        return _TextOnlyEventIterator(events)
-
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-        session_id: str,
-        *,
-        provider: ProviderConfig | None = None,
-    ) -> str:
-        stream = await self.stream(request, session_id, provider=provider)
-        return "".join([chunk async for chunk in stream])
 
     @staticmethod
     def _upload_target(workspace: Path, filename: str) -> tuple[Path, str]:

@@ -27,6 +27,21 @@ def utc_now() -> datetime:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionTurnRequest:
+    """WebAgent's transport-neutral input for one session turn."""
+
+    message: str
+    model: str
+    system_prompt: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.message.strip():
+            raise ValueError("message must not be empty")
+        if not self.model.strip():
+            raise ValueError("model must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class SessionRecord:
     """The durable mapping for one externally-addressable conversation."""
 

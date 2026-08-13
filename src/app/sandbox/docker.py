@@ -37,8 +37,8 @@ class DockerExecResult:
 class DockerSandboxManager:
     """One labelled, non-root Docker container and bind-mounted workspace per session."""
 
-    managed_label = "com.openai.claude-code-agent.managed"
-    session_label = "com.openai.claude-code-agent.session-id"
+    managed_label = "com.webagent.managed"
+    session_label = "com.webagent.session-id"
     worker_exec = "/usr/local/bin/oca-worker-exec"
     max_stream_line_bytes = 8 * 1024 * 1024
     max_stderr_bytes = 64 * 1024

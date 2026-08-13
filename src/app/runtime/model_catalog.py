@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -22,7 +22,7 @@ class ModelCatalogUnavailableError(RuntimeError):
 
 
 class ModelCatalog:
-    """Fetch ``/v1/models`` once per short TTL and retain a safe fallback."""
+    """Strictly discover ``/v1/models`` once per short TTL."""
 
     _allowed_auth_envs = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
 
@@ -32,7 +32,6 @@ class ModelCatalog:
         api_key: str,
         base_url: str | None,
         auth_env: str,
-        fallback_models: Sequence[str],
         cache_seconds: float = 300,
         client: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -42,13 +41,11 @@ class ModelCatalog:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") if base_url else None
         self.auth_env = auth_env
-        self.fallback_models = tuple(dict.fromkeys(model for model in fallback_models if model))
         self.cache_seconds = max(cache_seconds, 0)
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._owns_client = client is None
         self.clock = clock
         self._cached: tuple[str, ...] | None = None
-        self._cached_from_provider = False
         self._expires_at = 0.0
         self._lock = asyncio.Lock()
 
@@ -82,63 +79,49 @@ class ModelCatalog:
             return {"Authorization": f"Bearer {self.api_key}"}
         return {"x-api-key": self.api_key}
 
-    async def models(self) -> tuple[str, ...]:
+    async def discover(self) -> tuple[str, ...]:
+        """Discover models for an explicitly client-configured provider."""
+
         if self._cached is not None and self.clock() < self._expires_at:
             return self._cached
         async with self._lock:
             if self._cached is not None and self.clock() < self._expires_at:
                 return self._cached
             discovered = await self._fetch()
-            self._cached = discovered or self.fallback_models
-            self._cached_from_provider = bool(discovered)
-            self._expires_at = self.clock() + self.cache_seconds
-            return self._cached
-
-    async def discover(self) -> tuple[str, ...]:
-        """Strict provider discovery for an explicitly client-configured endpoint.
-
-        Unlike :meth:`models`, this never substitutes deployment fallbacks: the
-        browser must receive a clear error when its own provider configuration
-        is invalid or unavailable.
-        """
-
-        if (
-            self._cached is not None
-            and self._cached_from_provider
-            and self.clock() < self._expires_at
-        ):
-            return self._cached
-        async with self._lock:
-            if (
-                self._cached is not None
-                and self._cached_from_provider
-                and self.clock() < self._expires_at
-            ):
-                return self._cached
-            discovered = await self._fetch(strict=True)
             self._cached = discovered
-            self._cached_from_provider = True
             self._expires_at = self.clock() + self.cache_seconds
             return discovered
 
-    async def _fetch(self, *, strict: bool = False) -> tuple[str, ...]:
+    async def _fetch(self) -> tuple[str, ...]:
         endpoint = self.endpoint
         if not endpoint or not self.api_key:
-            return self._unavailable("未配置 Provider Endpoint 或 API Key", strict=strict)
+            raise ModelCatalogUnavailableError(
+                "未配置 Provider Endpoint 或 API Key", endpoint=self.safe_endpoint
+            )
         try:
             response = await self.client.get(endpoint, headers=self.headers)
         except httpx.TimeoutException:
-            return self._unavailable("上游请求超时", strict=strict)
+            raise ModelCatalogUnavailableError(
+                "上游请求超时", endpoint=self.safe_endpoint
+            ) from None
         except httpx.RequestError:
-            return self._unavailable("上游网络不可达", strict=strict)
+            raise ModelCatalogUnavailableError(
+                "上游网络不可达", endpoint=self.safe_endpoint
+            ) from None
         if not 200 <= response.status_code < 300:
-            return self._unavailable(f"上游返回 HTTP 状态 {response.status_code}", strict=strict)
+            raise ModelCatalogUnavailableError(
+                f"上游返回 HTTP 状态 {response.status_code}", endpoint=self.safe_endpoint
+            )
         try:
             payload: Any = response.json()
         except ValueError:
-            return self._unavailable("上游返回的 JSON 无效", strict=strict)
+            raise ModelCatalogUnavailableError(
+                "上游返回的 JSON 无效", endpoint=self.safe_endpoint
+            ) from None
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-            return self._unavailable("上游响应缺少 data 模型列表", strict=strict)
+            raise ModelCatalogUnavailableError(
+                "上游响应缺少 data 模型列表", endpoint=self.safe_endpoint
+            )
         models = tuple(
             dict.fromkeys(
                 item["id"].strip()
@@ -147,13 +130,8 @@ class ModelCatalog:
             )
         )
         if not models:
-            return self._unavailable("上游模型目录为空", strict=strict)
+            raise ModelCatalogUnavailableError("上游模型目录为空", endpoint=self.safe_endpoint)
         return models
-
-    def _unavailable(self, reason: str, *, strict: bool) -> tuple[str, ...]:
-        if strict:
-            raise ModelCatalogUnavailableError(reason, endpoint=self.safe_endpoint)
-        return ()
 
     async def aclose(self) -> None:
         if self._owns_client:

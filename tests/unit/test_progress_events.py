@@ -10,8 +10,6 @@ from pathlib import Path
 
 import pytest
 
-from app.openai_compat.schemas import ChatCompletionRequest
-from app.openai_compat.sse import iter_openai_sse
 from app.runtime.base import ProviderConfig, RuntimeContext
 from app.runtime.events import (
     Completed,
@@ -24,7 +22,7 @@ from app.runtime.events import (
 )
 from app.sandbox.local import LocalSandboxManager
 from app.sessions import SessionLockRegistry, SQLiteSessionRepository
-from app.sessions.models import SessionRecord, SessionState, utc_now
+from app.sessions.models import SessionRecord, SessionState, SessionTurnRequest, utc_now
 from app.sessions.reaper import LifecycleReaper
 from app.sessions.service import (
     SandboxUnavailableError,
@@ -197,9 +195,7 @@ class InspectFailsOnceSandbox(LocalSandboxManager):
 
 
 @pytest.mark.asyncio
-async def test_structured_stream_exposes_progress_summary_but_text_stream_stays_clean(
-    tmp_path: Path,
-) -> None:
+async def test_structured_stream_exposes_progress_and_terminal_summary(tmp_path: Path) -> None:
     repository = SQLiteSessionRepository(tmp_path / "sessions.db")
     service = SessionService(
         repository,
@@ -207,9 +203,7 @@ async def test_structured_stream_exposes_progress_summary_but_text_stream_stays_
         LocalSandboxManager(tmp_path / "workspaces"),
         ProgressRuntime(),
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     structured = await service.stream_events(request, "progress-session")
     events = [event async for event in structured]
@@ -225,31 +219,6 @@ async def test_structured_stream_exposes_progress_summary_but_text_stream_stays_
     assert (done.input_tokens, done.output_tokens) == (3, 5)
     assert done.duration_seconds >= 0
 
-    text = await service.stream(request, "progress-session")
-    assert [chunk async for chunk in text] == ["visible answer"]
-    await repository.close()
-
-
-@pytest.mark.asyncio
-async def test_closing_text_stream_releases_session_lock(tmp_path: Path) -> None:
-    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
-    service = SessionService(
-        repository,
-        SessionLockRegistry(),
-        LocalSandboxManager(tmp_path / "workspaces"),
-        ProgressRuntime(),
-    )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
-
-    first = await service.stream(request, "early-close")
-    assert await anext(first) == "visible answer"
-    await first.aclose()
-
-    second = await service.stream(request, "early-close")
-    assert await anext(second) == "visible answer"
-    await second.aclose()
     await repository.close()
 
 
@@ -262,9 +231,7 @@ async def test_unstarted_structured_stream_owns_and_releases_session_lock(tmp_pa
         LocalSandboxManager(tmp_path / "workspaces"),
         ProgressRuntime(),
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     reserved = await service.stream_events(request, "never-started")
     with pytest.raises(SessionBusyError):
@@ -272,29 +239,6 @@ async def test_unstarted_structured_stream_owns_and_releases_session_lock(tmp_pa
     await reserved.aclose()
 
     next_turn = await service.stream_events(request, "never-started")
-    await next_turn.aclose()
-    await repository.close()
-
-
-@pytest.mark.asyncio
-async def test_sse_role_only_disconnect_releases_unstarted_text_stream_lock(tmp_path: Path) -> None:
-    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
-    service = SessionService(
-        repository,
-        SessionLockRegistry(),
-        LocalSandboxManager(tmp_path / "workspaces"),
-        ProgressRuntime(),
-    )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
-
-    deltas = await service.stream(request, "sse-first-chunk")
-    response = iter_openai_sse(deltas, model="claude-code-agent")
-    assert b'"role":"assistant"' in await anext(response)
-    await response.aclose()
-
-    next_turn = await service.stream_events(request, "sse-first-chunk")
     await next_turn.aclose()
     await repository.close()
 
@@ -389,9 +333,7 @@ async def test_finalizer_failure_still_releases_session_lock_for_next_turn(tmp_p
         ProgressRuntime(),
         html_logger=FinalizingLogger(),  # type: ignore[arg-type]
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     first = await service.stream_events(request, "finalizer-lock")
     assert isinstance(await anext(first), Progress)
@@ -416,9 +358,7 @@ async def test_immediate_runtime_failure_is_not_completed_or_marked_resumable(
         LocalSandboxManager(tmp_path / "workspaces"),
         runtime,
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     first = await service.stream_events(request, "failed-before-session")
     events = [event async for event in first]
@@ -447,9 +387,7 @@ async def test_sqlite_log_failure_does_not_interrupt_a_turn(tmp_path: Path) -> N
         ProgressRuntime(),
         html_logger=FailingLogger(),  # type: ignore[arg-type]
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     stream = await service.stream_events(request, "log-write-failure")
     events = [event async for event in stream]
@@ -493,9 +431,7 @@ async def test_session_provider_is_turn_scoped_and_not_durable_metadata(tmp_path
         LocalSandboxManager(tmp_path / "workspaces"),
         runtime,
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
     first = ProviderConfig("https://first.example", "first-key", "ANTHROPIC_AUTH_TOKEN")
     second = ProviderConfig("https://second.example", "second-key", "ANTHROPIC_API_KEY")
 
@@ -526,9 +462,7 @@ async def test_session_effort_persists_and_next_resumed_turn_uses_patched_value(
         LocalSandboxManager(tmp_path / "workspaces"),
         runtime,
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     first = await service.stream_events(request, "effort-session", effort="medium")
     _ = [event async for event in first]
@@ -555,9 +489,7 @@ async def test_presentation_patch_retries_across_terminal_turn_update(tmp_path: 
         ProgressRuntime(),
     )
     await service.create_empty("racing-presentation", title="新会话")
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
     original_update = repository.update
     final_update_ready = asyncio.Event()
     release_final_update = asyncio.Event()
@@ -605,22 +537,8 @@ async def test_rest_created_session_persists_first_system_prompt_for_later_turns
         runtime,
     )
     await service.create_empty("web-created")
-    first = ChatCompletionRequest(
-        model="claude-code-agent",
-        messages=[
-            {"role": "system", "content": "始终使用中文"},
-            {"role": "user", "content": "first"},
-        ],
-        stream=True,
-    )
-    second = ChatCompletionRequest(
-        model="claude-code-agent",
-        messages=[
-            {"role": "system", "content": "后续覆盖尝试"},
-            {"role": "user", "content": "second"},
-        ],
-        stream=True,
-    )
+    first = SessionTurnRequest(message="first", model="test-model", system_prompt="始终使用中文")
+    second = SessionTurnRequest(message="second", model="test-model", system_prompt="后续覆盖尝试")
 
     events = await service.stream_events(first, "web-created")
     _ = [event async for event in events]

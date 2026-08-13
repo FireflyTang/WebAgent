@@ -11,11 +11,11 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app.openai_compat.schemas import ChatCompletionRequest
 from app.runtime.base import ProviderConfig
 from app.runtime.events import Progress, TextDelta, validate_effort
 from app.runtime.model_catalog import ModelCatalog, ModelCatalogUnavailableError
 from app.sessions.active_turns import ActiveTurn
+from app.sessions.models import SessionTurnRequest
 from app.sessions.service import SessionService, SessionServiceError, SessionTurnCompleted
 from app.sessions.ui_events import (
     ActiveTurnBusyError,
@@ -77,7 +77,6 @@ async def provider_models(payload: ProviderModelsRequest) -> dict[str, object]:
         api_key=payload.api_key,
         base_url=payload.base_url,
         auth_env=payload.auth_env,
-        fallback_models=(),
     )
     try:
         models = await catalog.discover()
@@ -405,7 +404,6 @@ async def websocket_chat(websocket: WebSocket) -> None:
                     send_lock=send_lock,
                 )
                 continue
-            messages: list[dict[str, str]] = []
             provider_payload = payload.get("provider")
             try:
                 provider = ProviderModelsRequest.model_validate(provider_payload)
@@ -447,7 +445,6 @@ async def websocket_chat(websocket: WebSocket) -> None:
                     api_key=provider.api_key,
                     base_url=provider.base_url,
                     auth_env=provider.auth_env,
-                    fallback_models=(),
                 )
                 provider_identity = identity
             try:
@@ -471,14 +468,11 @@ async def websocket_chat(websocket: WebSocket) -> None:
                 )
                 continue
             system_prompt = _text(payload.get("system_prompt"))
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": content})
             try:
-                request = ChatCompletionRequest(
+                request = SessionTurnRequest(
+                    message=content,
                     model=model,
-                    messages=messages,
-                    stream=True,
+                    system_prompt=system_prompt,
                 )
                 provider_config = ProviderConfig(
                     base_url=provider.base_url,

@@ -13,7 +13,6 @@ from app.main import create_app
 
 def settings_for(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="web-test-key",
         sandbox_backend="local",
         runtime_backend="fake",
         database_url=f"sqlite:///{tmp_path / 'web.db'}",
@@ -30,7 +29,7 @@ def _message(content: str) -> dict[str, object]:
     return {
         "type": "message",
         "content": content,
-        "model": "claude-code-agent",
+        "model": "test-model",
         "provider": {
             "base_url": "https://provider.example",
             "api_key": "test-key",
@@ -46,7 +45,7 @@ def _provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
             del kwargs
 
         async def discover(self) -> tuple[str, ...]:
-            return ("claude-code-agent",)
+            return ("test-model",)
 
         async def aclose(self) -> None:
             return None
@@ -156,3 +155,75 @@ def test_websocket_chat_streams_and_reuses_session(tmp_path: Path) -> None:
                 if event["type"] == "done":
                     break
             assert "第 2 轮" in second
+
+
+def test_websocket_session_replays_and_keeps_workspace_after_app_restart(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    session_id = "web-restart"
+
+    with TestClient(create_app(settings)) as first_client:
+        with first_client.websocket_connect("/ws/chat") as websocket:
+            websocket.send_json({"type": "hello", "session_id": session_id})
+            assert websocket.receive_json() == {"type": "sync_begin", "session_id": session_id}
+            assert websocket.receive_json()["type"] == "ready"
+
+            websocket.send_json(_message("创建计算器，实现加法"))
+            first_output = ""
+            while True:
+                event = websocket.receive_json()
+                if event["type"] == "delta":
+                    first_output += event["content"]
+                if event["type"] == "done":
+                    break
+
+        first_session = first_client.get(f"/v1/sessions/{session_id}").json()
+
+    assert "第 1 轮" in first_output
+    assert "测试通过" in first_output
+    workspace = tmp_path / "workspaces" / first_session["sandbox_id"]
+    assert (workspace / "calculator.py").exists()
+
+    with TestClient(create_app(settings)) as second_client:
+        with second_client.websocket_connect("/ws/chat") as websocket:
+            websocket.send_json({"type": "hello", "session_id": session_id})
+            assert websocket.receive_json() == {"type": "sync_begin", "session_id": session_id}
+            replayed = []
+            while True:
+                event = websocket.receive_json()
+                if event["type"] == "ready":
+                    assert event["session_id"] == session_id
+                    assert event["task_state"] == "idle"
+                    break
+                replayed.append(event)
+            assert any(event["type"] == "done" for event in replayed)
+
+            websocket.send_json(_message("增加减法"))
+            second_output = ""
+            while True:
+                event = websocket.receive_json()
+                if event["type"] == "delta":
+                    second_output += event["content"]
+                if event["type"] == "done":
+                    break
+
+        second_session = second_client.get(f"/v1/sessions/{session_id}").json()
+        transcript = second_client.get(f"/v1/sessions/{session_id}/transcript").json()
+
+    assert "第 2 轮" in second_output
+    assert "test_subtract" in second_output
+    assert second_session["sandbox_id"] == first_session["sandbox_id"]
+    assert second_session["runtime_session_id"] == first_session["runtime_session_id"]
+    assert [message["role"] for message in transcript["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [message["content"] for message in transcript["messages"]][::2] == [
+        "创建计算器，实现加法",
+        "增加减法",
+    ]
+    calculator = workspace / "calculator.py"
+    assert calculator.exists()
+    assert "def add" in calculator.read_text()
+    assert "def subtract" in calculator.read_text()

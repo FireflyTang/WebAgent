@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.runtime.base import RuntimeContext
+from app.runtime.base import ProviderConfig, RuntimeContext
 from app.runtime.claude import ClaudeCodeRuntime
 from app.runtime.events import Completed, Failed, TextDelta, Usage
 
@@ -34,6 +34,17 @@ async def collect(
     return [event async for event in runtime.send_message(runtime_id, message, context)]
 
 
+def provider_context(tmp_path: Path, **kwargs) -> RuntimeContext:
+    provider = kwargs.pop("provider", ProviderConfig(api_key="key"))
+    return RuntimeContext(
+        "external",
+        "sandbox",
+        tmp_path,
+        provider=provider,
+        **kwargs,
+    )
+
+
 @pytest.mark.asyncio
 async def test_claude_cli_starts_then_resumes_with_isolated_explicit_auth(
     tmp_path: Path, monkeypatch
@@ -43,10 +54,13 @@ async def test_claude_cli_starts_then_resumes_with_isolated_explicit_auth(
     executor = RecordingExecutor(
         [json.dumps({"type": "result", "usage": {"input_tokens": 3, "output_tokens": 5}})]
     )
-    context = RuntimeContext("external", "sandbox", tmp_path, "be concise")
-    runtime = ClaudeCodeRuntime(
-        "test-key", base_url="https://gateway.example/", model="claude-test", executor=executor
+    context = provider_context(
+        tmp_path,
+        system_prompt="be concise",
+        model="claude-test",
+        provider=ProviderConfig(base_url="https://gateway.example/", api_key="test-key"),
     )
+    runtime = ClaudeCodeRuntime(executor=executor)
     runtime_id = await runtime.create_session(context)
     await runtime.resume(runtime_id, context)  # SessionService reconciliation path.
 
@@ -103,8 +117,8 @@ async def test_claude_cli_maps_only_text_and_result_events(tmp_path: Path) -> No
             json.dumps({"type": "result", "usage": {"input_tokens": 2, "output_tokens": 4}}),
         ]
     )
-    context = RuntimeContext("external", "sandbox", tmp_path)
-    runtime = ClaudeCodeRuntime("key", executor=executor)
+    context = provider_context(tmp_path)
+    runtime = ClaudeCodeRuntime(executor=executor)
     runtime_id = await runtime.create_session(context)
     events = await collect(runtime, runtime_id, "hi", context)
 
@@ -114,29 +128,16 @@ async def test_claude_cli_maps_only_text_and_result_events(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_context_model_overrides_runtime_default(tmp_path: Path) -> None:
+async def test_claude_cli_uses_context_model(tmp_path: Path) -> None:
     executor = RecordingExecutor([json.dumps({"type": "result", "result": "done"})])
-    context = RuntimeContext("external", "sandbox", tmp_path, model="glm-5.2")
-    runtime = ClaudeCodeRuntime("key", model="glm-4.7", executor=executor)
+    context = provider_context(tmp_path, model="glm-5.2")
+    runtime = ClaudeCodeRuntime(executor=executor)
     runtime_id = await runtime.create_session(context)
 
     await collect(runtime, runtime_id, "hi", context)
 
     command = executor.calls[0][0]
     assert command[command.index("--model") + 1] == "glm-5.2"
-
-
-@pytest.mark.asyncio
-async def test_claude_cli_openai_model_alias_keeps_runtime_default(tmp_path: Path) -> None:
-    executor = RecordingExecutor([json.dumps({"type": "result", "result": "done"})])
-    context = RuntimeContext("external", "sandbox", tmp_path, model="claude-code-agent")
-    runtime = ClaudeCodeRuntime("key", model="glm-4.7", executor=executor)
-    runtime_id = await runtime.create_session(context)
-
-    await collect(runtime, runtime_id, "hi", context)
-
-    command = executor.calls[0][0]
-    assert command[command.index("--model") + 1] == "glm-4.7"
 
 
 @pytest.mark.asyncio
@@ -152,8 +153,8 @@ async def test_claude_cli_uses_result_as_visible_fallback_without_duplicate(tmp_
             json.dumps({"type": "result", "subtype": "success", "result": "done"}),
         ]
     )
-    context = RuntimeContext("external", "sandbox", tmp_path)
-    runtime = ClaudeCodeRuntime("key", executor=executor)
+    context = provider_context(tmp_path)
+    runtime = ClaudeCodeRuntime(executor=executor)
     runtime_id = await runtime.create_session(context)
 
     events = await collect(runtime, runtime_id, "hi", context)
@@ -163,7 +164,7 @@ async def test_claude_cli_uses_result_as_visible_fallback_without_duplicate(tmp_
     fallback_executor = RecordingExecutor(
         [json.dumps({"type": "result", "subtype": "success", "result": "summary"})]
     )
-    fallback_runtime = ClaudeCodeRuntime("key", executor=fallback_executor)
+    fallback_runtime = ClaudeCodeRuntime(executor=fallback_executor)
     fallback_id = await fallback_runtime.create_session(context)
     fallback_events = await collect(fallback_runtime, fallback_id, "hi", context)
     assert [event.text for event in fallback_events if isinstance(event, TextDelta)] == ["summary"]
@@ -179,7 +180,7 @@ async def test_claude_cli_uses_result_as_visible_fallback_without_duplicate(tmp_
             json.dumps({"type": "result", "subtype": "success", "result": "done"}),
         ]
     )
-    chunked_runtime = ClaudeCodeRuntime("key", executor=chunked_executor)
+    chunked_runtime = ClaudeCodeRuntime(executor=chunked_executor)
     chunked_id = await chunked_runtime.create_session(context)
     chunked_events = await collect(chunked_runtime, chunked_id, "hi", context)
     assert "".join(event.text for event in chunked_events if isinstance(event, TextDelta)) == "done"
@@ -199,8 +200,8 @@ async def test_claude_cli_does_not_expose_failed_result_diagnostics(tmp_path: Pa
             )
         ]
     )
-    context = RuntimeContext("external", "sandbox", tmp_path)
-    runtime = ClaudeCodeRuntime("key", executor=executor)
+    context = provider_context(tmp_path)
+    runtime = ClaudeCodeRuntime(executor=executor)
     runtime_id = await runtime.create_session(context)
 
     events = await collect(runtime, runtime_id, "hi", context)
@@ -212,8 +213,10 @@ async def test_claude_cli_does_not_expose_failed_result_diagnostics(tmp_path: Pa
 @pytest.mark.asyncio
 async def test_claude_cli_lifecycle_and_failures_are_local(tmp_path: Path) -> None:
     executor = RecordingExecutor(error=OSError("not installed"))
-    context = RuntimeContext("external", "sandbox", tmp_path)
-    runtime = ClaudeCodeRuntime("key", auth_env="ANTHROPIC_AUTH_TOKEN", executor=executor)
+    context = provider_context(
+        tmp_path, provider=ProviderConfig(api_key="key", auth_env="ANTHROPIC_AUTH_TOKEN")
+    )
+    runtime = ClaudeCodeRuntime(executor=executor)
     runtime_id = await runtime.create_session(context)
 
     failed = await collect(runtime, runtime_id, "hi", context)
@@ -235,8 +238,8 @@ async def test_claude_cli_lifecycle_and_failures_are_local(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_claude_cli_restored_session_uses_resume(tmp_path: Path) -> None:
     executor = RecordingExecutor([json.dumps({"type": "result"})])
-    context = RuntimeContext("external", "sandbox", tmp_path)
-    runtime = ClaudeCodeRuntime("key", executor=executor)
+    context = provider_context(tmp_path)
+    runtime = ClaudeCodeRuntime(executor=executor)
 
     await collect(runtime, "persisted-cli-session", "continue", context)
 
@@ -250,8 +253,8 @@ async def test_claude_cli_restored_upload_only_session_still_uses_session_id(
     tmp_path: Path,
 ) -> None:
     executor = RecordingExecutor([json.dumps({"type": "result"})])
-    context = RuntimeContext("external", "sandbox", tmp_path)
-    runtime = ClaudeCodeRuntime("key", executor=executor)
+    context = provider_context(tmp_path)
+    runtime = ClaudeCodeRuntime(executor=executor)
 
     await runtime.restore_session_state("upload-only-session", started=False)
     await runtime.resume("upload-only-session", context)
@@ -259,8 +262,3 @@ async def test_claude_cli_restored_upload_only_session_still_uses_session_id(
 
     command = executor.calls[0][0]
     assert command[command.index("--session-id") + 1] == "upload-only-session"
-
-
-def test_claude_cli_rejects_unapproved_auth_environment() -> None:
-    with pytest.raises(ValueError, match="auth_env"):
-        ClaudeCodeRuntime("key", auth_env="CLAUDE_CODE_OAUTH_TOKEN")

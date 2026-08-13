@@ -52,7 +52,7 @@ class Progress:
 
 @dataclass(frozen=True, slots=True)
 class Diagnostic:
-    """Structured provider diagnostics excluded from chat/WS/SSE but available to debug logs."""
+    """Structured provider diagnostics excluded from chat and WebSocket output, but kept in debug logs."""
 
     message_type: str
     subtype: str | None = None

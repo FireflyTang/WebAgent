@@ -12,7 +12,6 @@ from app.sessions.runtime_debug import append_runtime_debug
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="log-test-key",
         sandbox_backend="local",
         runtime_backend="fake",
         database_url=f"sqlite:///{tmp_path / 'sessions.db'}",

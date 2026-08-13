@@ -109,7 +109,7 @@ def _normalise_database_path(database: str | Path) -> tuple[str, bool]:
     if value == ":memory:":
         # A named shared in-memory database remains alive via an anchor
         # connection, while normal operations can still run in worker threads.
-        return f"file:openai_claude_sessions_{uuid4().hex}?mode=memory&cache=shared", True
+        return f"file:webagent_sessions_{uuid4().hex}?mode=memory&cache=shared", True
     return value, value.startswith("file:")
 
 

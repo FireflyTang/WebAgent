@@ -199,7 +199,7 @@ class SessionStateMachineTests(unittest.TestCase):
                 claude_session_id="runtime",
                 metadata={"runtime_backend": "FakeRuntime"},
             )
-            old_runtime = current.with_metadata(runtime_backend="ZhipuRuntime")
+            legacy_runtime = current.with_metadata(runtime_backend="LegacyRuntime")
             old_sandbox = SessionRecord(
                 session_id="old-sandbox",
                 sandbox_id="oca-sandbox-123",
@@ -208,7 +208,9 @@ class SessionStateMachineTests(unittest.TestCase):
             )
 
             self.assertEqual(service.compatibility_view(current), (True, None))
-            self.assertEqual(service.compatibility_view(old_runtime), (False, "运行时后端不兼容"))
+            self.assertEqual(
+                service.compatibility_view(legacy_runtime), (False, "运行时后端不兼容")
+            )
             self.assertEqual(service.compatibility_view(old_sandbox), (False, "沙箱后端不兼容"))
 
 

@@ -82,7 +82,7 @@ def _provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
             del kwargs
 
         async def discover(self) -> tuple[str, ...]:
-            return ("claude-code-agent",)
+            return ("test-model",)
 
         async def aclose(self) -> None:
             return None
@@ -94,7 +94,7 @@ def _message(content: str) -> dict[str, object]:
     return {
         "type": "message",
         "content": content,
-        "model": "claude-code-agent",
+        "model": "test-model",
         "provider": {
             "base_url": "https://provider.example",
             "api_key": "test-key",
@@ -105,7 +105,6 @@ def _message(content: str) -> dict[str, object]:
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="turn-key",
         runtime_backend="fake",
         sandbox_backend="local",
         database_url=f"sqlite:///{tmp_path / 'turns.db'}",

@@ -6,7 +6,7 @@ WebAgent v0.3.0 是可信本地环境中的单人 Demo。本页同时记录当�
 
 ### 安全与部署
 
-- Web、Session、文件和日志路由没有用户鉴权、授权或租户隔离；OpenAI-compatible API 的共享 Bearer Key 也不是多用户权限系统。
+- Web、Session、文件和日志路由没有用户鉴权、授权或租户隔离。
 - Docker worker 设置了非 root 用户与资源限制，但没有生产级 seccomp/AppArmor、只读根文件系统、网络策略、镜像供应链验证或敌对代码隔离承诺。
 - Local sandbox 只分开目录，不隔离宿主机权限。
 - 仅支持单 Uvicorn worker。Session 锁、active turn、订阅和 Journal pending suffix 都是进程内状态。
@@ -32,8 +32,7 @@ WebAgent v0.3.0 是可信本地环境中的单人 Demo。本页同时记录当�
 
 - Claude Agent SDK 仍是固定的 0.x 依赖；项目用 worker 内 NDJSON adapter 隔离上层协议，但升级仍需完整回归。
 - 模型动态目录只保证 ID。能力、上下文、价格、描述、推荐和 effort 支持没有统一可信协议。
-- Provider 的 Anthropic-compatible 模型目录可能与其 OpenAI-compatible 目录不同；WebAgent 不跨协议猜测或补齐。
-- OpenAI-compatible SSE 以文本兼容为主，不承载 Web UI 的全部结构化 progress，usage 语义也不是完整的跨 Provider 标准化层。
+- Provider 的模型目录和能力表达并不统一；WebAgent 不猜测或补齐缺失信息。
 - 旧 CLI runtime 创建的 Session 不自动迁移为 SDK Session；需新建 Session 或设计显式迁移。
 
 ### 浏览器与体验

@@ -4,7 +4,7 @@
 
 > 一个非官方、本地优先的 Coding Agent 工作台：对话下任务、观察工具执行、查看文件，还能让多个任务同时推进。
 
-WebAgent 把轻量 FastAPI 服务和按 Session 隔离的 Docker worker 组合成容易上手的浏览器工作台。你可以让 Agent 修改代码、运行测试，切到另一个 Session 继续安排任务，稍后回来查看结果。项目也保留了精简的 OpenAI-compatible API 和确定性的 Fake runtime，因此不购买模型额度也能体验完整的 Session 与流式流程。
+WebAgent 把轻量 FastAPI 服务和按 Session 隔离的 Docker worker 组合成容易上手的浏览器工作台。你可以让 Agent 修改代码、运行测试，切到另一个 Session 继续安排任务，稍后回来查看结果。
 
 WebAgent 当前版本是 **v0.3.0**，是一个**非官方 Demo**。它适合可信本机上的单人体验，不是可直接公网托管的多人产品。
 
@@ -23,35 +23,22 @@ WebAgent 当前版本是 **v0.3.0**，是一个**非官方 Demo**。它适合可
 | 项目文件操作 | 上传文件或目录、浏览工作区，双击文件即可下载 |
 | 真正停止任务 | Stop 会取消服务端流以及 worker 内正在运行的命令 |
 | 自带兼容 Provider | Web UI 从 Anthropic-compatible Endpoint 读取模型 ID，不虚构描述或推荐 |
-| 脚本集成 | 提供精简的 OpenAI Chat Completions-compatible 流式 API |
 
 ![WebAgent 窄屏布局，文件抽屉已打开](docs/assets/webagent-demo-narrow.png)
 
 *宣传用窄屏示意 Demo，中文界面。*
 
-## 快速开始：不需要 Provider
+## 启动浏览器工作台
 
-需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)、Docker 和 curl。
+需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)、Docker 和浏览器。
 
 ```bash
 docker build -t webagent-worker:latest -f Dockerfile.worker .
 uv sync --locked
 cp .env.example .env
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-打开另一个终端：
-
-```bash
-curl http://127.0.0.1:8000/healthz
-./scripts/smoke_curl.sh
-```
-
-示例配置默认使用 `FakeRuntime` 和 Docker sandbox。Fake curl 路径**不需要 Provider Endpoint 或 API Key**：它会创建真实 Session 与工作区，流式返回确定性结果，生成计算器文件、运行测试、继续同一 Session，并检查生命周期接口。没有 Docker 时可用 `SANDBOX_BACKEND=local` 做轻量开发回退；它只能分开目录，不提供安全隔离。
-
-## 使用真实 Web 工作台
-
-默认 Fake runtime 不会因为浏览器填写了 Provider 就变成真实 Agent。先修改 `.env` 并重启 WebAgent：
+要执行浏览器任务，请先修改 `.env`：
 
 ```env
 RUNTIME_BACKEND=claude
@@ -59,7 +46,13 @@ SANDBOX_BACKEND=docker
 DOCKER_NETWORK_MODE=host
 ```
 
-然后打开 <http://127.0.0.1:8000/>。浏览器工作流明确要求配置 Provider：
+然后启动服务并打开 <http://127.0.0.1:8000/>：
+
+```bash
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+浏览器工作流明确要求配置 Provider：
 
 1. 打开连接设置。
 2. 填写 **Anthropic-compatible** Endpoint、API Key 和认证方式（`Bearer` 或 `x-api-key`）。
@@ -71,37 +64,9 @@ Provider 配置保存在当前浏览器中，并随每轮 Web 任务提交。Web
 
 模型菜单只展示 ID。这是有意设计：不同 Provider 没有统一可信的模型描述、价格、能力和推荐协议。
 
-给 OpenAI-compatible curl 路径使用真实 SDK runtime 时，还可以配置可选的部署级默认值：
+`RUNTIME_BACKEND=claude` 会在 worker 内运行固定版本的 Claude Agent SDK；`claude-cli` 仅作为显式兼容回退。Provider 的 Endpoint、凭据、认证方式和模型均由浏览器随每个 turn 唯一提供。WebAgent 不绑定某家 Provider，也不会在产品流程里写死模型 ID。
 
-```env
-RUNTIME_BACKEND=claude
-SANDBOX_BACKEND=docker
-CLAUDE_API_KEY=<你的 Key>
-CLAUDE_BASE_URL=<Anthropic-compatible 基础地址>
-CLAUDE_MODEL=<该 Provider 返回的模型 ID>
-CLAUDE_AUTH_ENV=ANTHROPIC_API_KEY
-DOCKER_NETWORK_MODE=host
-```
-
-`RUNTIME_BACKEND=claude` 会在 worker 内运行固定版本的 Claude Agent SDK；`claude-cli` 仅作为显式兼容回退。WebAgent 不绑定某家 Provider，也不会在产品流程里写死模型 ID。
-
-## curl API 示例
-
-下面的 API Key 只保护 OpenAI-compatible 接口，与 Provider Key 是两回事：
-
-```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Authorization: Bearer demo-local-key' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-ID: hello-webagent' \
-  -d '{
-    "model": "claude-code-agent",
-    "stream": true,
-    "messages": [{"role": "user", "content": "创建一个支持加法的计算器并运行测试"}]
-  }'
-```
-
-继续使用相同的 `X-Session-ID` 即可多轮对话。FakeRuntime 支持计算器/加法、减法、`mock:write`、`mock:choice`、`permission`、`mock:slow` 和 `mock:error` 等演示触发词。
+示例默认 `RUNTIME_BACKEND=fake`，用于确定性开发与自动化检查；它不会绕过浏览器的 Provider 校验，因此不是无需 Provider 的浏览器任务路径。没有 Docker 时可用 `SANDBOX_BACKEND=local` 做轻量开发回退；它只能分开目录，不提供安全隔离。
 
 ## 架构
 
@@ -109,10 +74,8 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 flowchart LR
     UI[React 工作台] -->|REST: Session、文件、模型| API[FastAPI]
     UI <-->|WebSocket 订阅与控制| Turns[应用持有的 Turn]
-    Curl[curl / OpenAI 客户端] -->|Chat Completions + SSE| API
     API --> DB[(SQLite: Session、Transcript、事件、日志)]
     Turns --> Runtime[Fake 或 Agent SDK runtime]
-    API --> Runtime
     Runtime --> Worker[每 Session 一个 Docker worker]
     Worker <--> Files[持久工作区]
     Turns --> Journal[有序 UI Event Journal]
@@ -149,16 +112,7 @@ uv run pytest -q -m integration tests/integration
 
 基础 Python、browser 和 Docker integration 是三个独立套件，因此新机器上的前置条件清晰可复现。Push 与 Pull Request CI 会执行 Python 检查、前端审计/测试/构建、wheel 构建安装验证，以及 Chromium/WebKit browser tests；Docker integration 只在手工 workflow 和正式 Release 中运行。
 
-当前 v0.3.0 发布证据：
-
-- Python：**193 passed, 1 skipped, 1 warning**
-- 浏览器：**34 passed, 1 skipped**（包含窄屏设置入口）
-- 前端协议：**3 passed**
-- Docker integration：**5 passed**（包含跨 UID workspace 访问）
-- `npm audit`：**0 vulnerabilities**
-- Fake/local curl smoke：**passed**
-
-跳过项是已记录的 WebKit 环境限制；Chromium 覆盖通过。当前完整矩阵见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+发布前请在目标分支运行以上命令。验证范围和环境限制见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ## 文档
 
@@ -173,4 +127,4 @@ uv run pytest -q -m integration tests/integration
 
 ## License
 
-[MIT](LICENSE)。WebAgent 是非官方项目，与 OpenAI 或 Anthropic 均无隶属关系或官方背书。
+[MIT](LICENSE)。WebAgent 是非官方项目，不受任何模型 Provider 官方背书。

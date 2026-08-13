@@ -2,12 +2,11 @@
 
 ## Intended use
 
-WebAgent is a trusted, local demonstration project. Its OpenAI-compatible model
-endpoints use one shared bearer key, but the browser UI and session-management
-routes do not implement user authentication, tenant isolation, or an
-authorization boundary. Run it only on a machine and network you trust, and
-keep the HTTP service bound to loopback unless you have placed a properly
-configured authentication proxy in front of it.
+WebAgent is a trusted, local demonstration project. Its browser UI and
+session-management routes do not implement user authentication, tenant
+isolation, or an authorization boundary. Run it only on a machine and network
+you trust, and keep the HTTP service bound to loopback unless you have placed a
+properly configured authentication proxy in front of it.
 
 Coding agents can execute commands and read or write files inside their
 configured workspace. Docker-backed sandboxes reduce accidental host access,

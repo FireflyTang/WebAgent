@@ -18,8 +18,8 @@ WebAgent 是“通过对话驱动持久代码沙箱”的单人工作台。每�
 - 应用持有的后台 turn。不同 Session 可并行；关闭页面不取消任务，重连会回放历史并继续实时订阅；同一 Session 同时只运行一个任务。
 - 真实 Stop、结构化步骤与活动、任务/步骤耗时、终态和 usage 展示，不暴露模型思维链。
 - 上传文件/目录、树形浏览和双击下载；没有内置预览、编辑器或 Diff。
-- SQLite Transcript、UI event history 和详细诊断日志，以及 OpenAI-compatible curl/SSE 入口。
-- FakeRuntime 无 Provider 演示，和 Docker worker 内的真实 Agent SDK 路径。
+- SQLite Transcript、UI event history 和详细诊断日志。
+- FakeRuntime 的确定性演示，和 Docker worker 内的真实 Agent SDK 路径。
 
 ## 核心用户流程
 

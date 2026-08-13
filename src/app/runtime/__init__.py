@@ -3,7 +3,6 @@ from .base import AgentRuntime, ProviderConfig, RuntimeContext
 from .claude import ClaudeCodeRuntime
 from .events import Completed, Failed, InteractionRequest, Progress, RuntimeEvent, TextDelta, Usage
 from .fake import FakeRuntime
-from .zhipu import ZhipuRuntime
 
 __all__ = [
     "AgentRuntime",
@@ -19,5 +18,4 @@ __all__ = [
     "RuntimeEvent",
     "TextDelta",
     "Usage",
-    "ZhipuRuntime",
 ]
