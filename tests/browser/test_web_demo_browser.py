@@ -3037,7 +3037,10 @@ def test_session_context_menu_delete_cancel_nonactive_and_active_switch(
     assert box["y"] + box["height"] <= 900
     page.keyboard.press("Escape")
     assert menu.is_hidden()
-    assert page.evaluate("document.activeElement.dataset.sessionId") == second_id
+    page.wait_for_function(
+        "sessionId => document.activeElement?.dataset.sessionId === sessionId",
+        arg=second_id,
+    )
 
     second_row.click(button="right")
     page.once("dialog", lambda dialog: dialog.dismiss())
