@@ -59,3 +59,4 @@ runner 的实际 Codex home 通过 GitHub Actions repository variable `CODEX_HOM
 - [`.github/ISSUE_TEMPLATE/request.yml`](../.github/ISSUE_TEMPLATE/request.yml)：普通请求与可选 mention 入口。
 
 runner 专用限制只存在于 workflow 生成的 prompt 中；仓库没有为此新增 `AGENTS.md`，因此不会改变日常本地 Codex 的行为。
+公开回复只允许使用仓库相对路径和行号，不应输出 runner 的主机路径、用户名或 worktree 根目录。

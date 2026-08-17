@@ -230,6 +230,8 @@ class NormalizeEventTests(unittest.TestCase):
         self.assertIn("本段只约束这一次 GitHub runner 执行", prompt)
         self.assertIn("不要拒绝", prompt)
         self.assertIn("把工作区交给 workflow 发布", prompt)
+        self.assertIn("不要在最终回复中输出 runner 的绝对路径", prompt)
+        self.assertIn("src/app/main.py:42", prompt)
 
 
 if __name__ == "__main__":
