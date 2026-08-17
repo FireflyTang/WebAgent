@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import dataclasses
+import errno
 import hashlib
 import logging
+import mimetypes
+import os
 import sqlite3
+import stat
+import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import TypeVar
+from typing import NoReturn, TypeVar
 
-from app.openai_compat.schemas import ChatCompletionRequest
 from app.runtime import (
     AgentRuntime,
     Completed,
@@ -28,7 +33,7 @@ from app.sandbox import SandboxManager
 
 from .html_log import SessionHtmlLogger
 from .locks import SessionLockRegistry
-from .models import SessionRecord, SessionState, utc_now
+from .models import SessionRecord, SessionState, SessionTurnRequest, utc_now
 from .repository import SessionLogEntry, SessionRepository, SessionVersionConflictError
 from .runtime_debug import append_runtime_debug
 from .state_machine import touch, transition
@@ -36,6 +41,41 @@ from .state_machine import touch, transition
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
 _UNSET = object()
+_RENAME_EXCHANGE = 0x2
+
+
+def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
+    """Atomically exchange two names in one directory on Linux.
+
+    ``rename(2)`` has no compare-and-swap mode: a final path ``stat`` before
+    ``os.replace`` still leaves a scheduling window.  Exchange keeps a
+    concurrently installed target inode recoverable under ``first`` so it can
+    be restored when its identity differs from the checked revision inode.
+    """
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:  # pragma: no cover - Linux is a deployment requirement
+        raise SessionServiceError("Atomic editor replacement requires renameat2") from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            directory_fd,
+            os.fsencode(first),
+            directory_fd,
+            os.fsencode(second),
+            _RENAME_EXCHANGE,
+        )
+        != 0
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 class _SessionEventLease(AsyncIterator[T]):
@@ -74,46 +114,6 @@ class _SessionEventLease(AsyncIterator[T]):
         finally:
             if self._lock.locked():
                 self._lock.release()
-
-    async def aclose(self) -> None:
-        async with self._operation_lock:
-            await self._close_unlocked()
-
-
-class _TextOnlyEventIterator(AsyncIterator[str]):
-    """Project text deltas while retaining explicit ownership of the event lease."""
-
-    def __init__(self, events: AsyncIterator[TextDelta | object]) -> None:
-        self._events = events
-        self._closed = False
-        self._operation_lock = asyncio.Lock()
-
-    def __aiter__(self) -> _TextOnlyEventIterator:
-        return self
-
-    async def __anext__(self) -> str:
-        async with self._operation_lock:
-            if self._closed:
-                raise StopAsyncIteration
-            try:
-                while True:
-                    event = await anext(self._events)
-                    if isinstance(event, TextDelta):
-                        return event.text
-            except BaseException:
-                await self._close_unlocked()
-                raise
-
-    async def _close_unlocked(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._events.aclose()
-        except AttributeError:
-            # AsyncIterator's protocol does not declare aclose, but all event
-            # streams constructed by SessionService are explicit leases.
-            return
 
     async def aclose(self) -> None:
         async with self._operation_lock:
@@ -159,6 +159,95 @@ class InvalidWorkspacePathError(SessionServiceError):
     code = "invalid_workspace_path"
 
 
+class FileChangedError(SessionServiceError):
+    code = "file_changed"
+
+
+class FileTooLargeError(SessionServiceError):
+    code = "file_too_large"
+
+
+class FileUploadLimitError(SessionServiceError):
+    code = "file_upload_limit"
+
+
+class OpenedWorkspaceFile:
+    """Own an already-open regular file and stream only that inode.
+
+    The descriptor is opened relative to the workspace directory descriptor.
+    It therefore remains bound to the validated inode even if an agent renames,
+    removes, or replaces the visible path before the HTTP body is consumed.
+    """
+
+    chunk_size = 64 * 1024
+
+    def __init__(self, fd: int, normalized_path: str) -> None:
+        self.normalized_path = normalized_path
+        self._fd: int | None = fd
+        self._io_lock = threading.Lock()
+        self._stream_started = False
+
+    @property
+    def closed(self) -> bool:
+        with self._io_lock:
+            return self._fd is None
+
+    def _read_chunk(self) -> bytes:
+        with self._io_lock:
+            if self._fd is None:
+                return b""
+            return os.read(self._fd, self.chunk_size)
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        if self._stream_started:
+            raise RuntimeError("Workspace file stream has already been consumed")
+        self._stream_started = True
+        try:
+            while chunk := await asyncio.to_thread(self._read_chunk):
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._io_lock:
+            fd, self._fd = self._fd, None
+            if fd is not None:
+                os.close(fd)
+
+    def read_all(self, limit: int | None = None) -> bytes:
+        """Read this already validated inode, optionally retaining a small sample."""
+        with self._io_lock:
+            if self._fd is None:
+                raise RuntimeError("Workspace file is closed")
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = limit
+            while remaining is None or remaining > 0:
+                chunk = os.read(
+                    self._fd, 64 * 1024 if remaining is None else min(64 * 1024, remaining)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+            return b"".join(chunks)
+
+    def stat(self) -> os.stat_result:
+        with self._io_lock:
+            if self._fd is None:
+                raise RuntimeError("Workspace file is closed")
+            return os.fstat(self._fd)
+
+    def __del__(self) -> None:
+        # Best-effort fallback for a response object that is discarded before
+        # ASGI starts it. Normal request paths close explicitly in the response.
+        try:
+            self.close()
+        except OSError:
+            pass
+
+
 class SessionService:
     """Coordinates the durable mapping, sandbox, and runtime for one turn."""
 
@@ -179,6 +268,10 @@ class SessionService:
         self.runtime = runtime
         self.delete_workspace = delete_workspace
         self.html_logger = html_logger
+        self._upload_locks: dict[str, asyncio.Lock] = {}
+        # Test-only synchronization point for proving editor writes reject a
+        # pathname replacement that happens after revision validation.
+        self._editor_revision_checked_hook: Callable[[], None] | None = None
         if delete_after_seconds <= 0:
             raise ValueError("delete_after_seconds must be positive")
         self.delete_after_seconds = delete_after_seconds
@@ -280,22 +373,13 @@ class SessionService:
         except Exception as exc:
             raise SandboxUnavailableError("Sandbox backend is unavailable") from exc
 
-    @staticmethod
-    def _inputs(request: ChatCompletionRequest) -> tuple[str, str | None]:
-        user = next(
-            message.content for message in reversed(request.messages) if message.role == "user"
-        )
-        system = next(
-            (message.content for message in request.messages if message.role == "system"), None
-        )
-        return user, system
-
     async def _create(
         self,
         session_id: str,
         system_prompt: str | None,
         provider: ProviderConfig | None = None,
         effort: Effort | None = None,
+        owner_user_id: str | None = None,
     ) -> SessionRecord:
         info = await self._sandbox_call(self.sandbox.create(session_id))
         context = RuntimeContext(
@@ -311,6 +395,7 @@ class SessionService:
             runtime_id = await self.runtime.create_session(context)
             record = SessionRecord(
                 session_id=session_id,
+                owner_user_id=owner_user_id,
                 sandbox_id=info.sandbox_id,
                 claude_session_id=runtime_id,
                 metadata={
@@ -347,11 +432,12 @@ class SessionService:
         title: str | None = None,
         last_model: str | None = None,
         last_effort: str | None = None,
+        owner_user_id: str | None = None,
     ) -> SessionRecord:
         """Create the durable sandbox/runtime mapping before a first chat turn."""
 
         effort = validate_effort(last_effort)
-        record = await self._create(session_id, None, effort=effort)
+        record = await self._create(session_id, None, effort=effort, owner_user_id=owner_user_id)
         if title is None and last_model is None:
             return record
         return await self._update_with_retry(
@@ -542,7 +628,7 @@ class SessionService:
 
     async def _run_turn_events(
         self,
-        request: ChatCompletionRequest,
+        request: SessionTurnRequest,
         session_id: str,
         provider: ProviderConfig | None = None,
         effort: Effort | None = None,
@@ -558,7 +644,8 @@ class SessionService:
         finalizing_started_at: float | None = None
         preparing_started_at: float | None = None
         started_at = time.monotonic()
-        message, system_prompt = self._inputs(request)
+        message = request.message
+        system_prompt = request.system_prompt
         try:
             await self._append_log(
                 session_id,
@@ -690,7 +777,7 @@ class SessionService:
 
     async def stream_events(
         self,
-        request: ChatCompletionRequest,
+        request: SessionTurnRequest,
         session_id: str,
         *,
         provider: ProviderConfig | None = None,
@@ -703,26 +790,6 @@ class SessionService:
         await lock.acquire()
         inner = self._run_turn_events(request, session_id, provider, effort)
         return _SessionEventLease(inner, lock)
-
-    async def stream(
-        self,
-        request: ChatCompletionRequest,
-        session_id: str,
-        *,
-        provider: ProviderConfig | None = None,
-    ) -> AsyncIterator[str]:
-        events = await self.stream_events(request, session_id, provider=provider)
-        return _TextOnlyEventIterator(events)
-
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-        session_id: str,
-        *,
-        provider: ProviderConfig | None = None,
-    ) -> str:
-        stream = await self.stream(request, session_id, provider=provider)
-        return "".join([chunk async for chunk in stream])
 
     @staticmethod
     def _upload_target(workspace: Path, filename: str) -> tuple[Path, str]:
@@ -752,20 +819,51 @@ class SessionService:
         self,
         session_id: str,
         files: Sequence[tuple[str, bytes]],
+        *,
+        max_files_per_session: int = 10,
     ) -> list[dict[str, object]]:
         if not files:
             raise InvalidWorkspacePathError("At least one file is required")
+        if max_files_per_session <= 0:
+            raise ValueError("max_files_per_session must be positive")
+        # Serialize uploads separately before touching the turn lock.  This
+        # lets concurrent browser uploads observe the committed count in order,
+        # while an actual agent turn still rejects uploads immediately below.
+        upload_lock = self._upload_locks.setdefault(session_id, asyncio.Lock())
+        async with upload_lock:
+            return await self._upload_files_locked(session_id, files, max_files_per_session)
+
+    async def _upload_files_locked(
+        self,
+        session_id: str,
+        files: Sequence[tuple[str, bytes]],
+        max_files_per_session: int,
+    ) -> list[dict[str, object]]:
         lock = self.locks.lock_for(session_id)
         if lock.locked():
             raise SessionBusyError("Cannot upload files while the session is running")
         async with lock:
-            _, context = await self._prepare(session_id, None)
+            record, context = await self._prepare(session_id, None)
+            count = record.metadata.get("uploaded_file_count", 0)
+            current_count = count if isinstance(count, int) and not isinstance(count, bool) else 0
+            if current_count < 0:
+                current_count = 0
+            next_count = current_count + len(files)
+            if next_count > max_files_per_session:
+                raise FileUploadLimitError(
+                    f"Uploading {len(files)} file(s) would exceed the "
+                    f"{max_files_per_session}-file session limit"
+                )
             uploaded: list[dict[str, object]] = []
             for filename, content in files:
                 target, normalized = self._upload_target(context.workspace, filename)
                 await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
                 await asyncio.to_thread(target.write_bytes, content)
                 uploaded.append({"path": normalized, "size": len(content)})
+            await self._update_with_retry(
+                session_id,
+                lambda latest: latest.with_metadata(uploaded_file_count=next_count),
+            )
             await self._append_log(
                 session_id,
                 title="上传文件",
@@ -775,51 +873,410 @@ class SessionService:
             return uploaded
 
     async def list_files(self, session_id: str) -> list[dict[str, object]]:
-        lock = self.locks.lock_for(session_id)
-        if lock.locked():
-            raise SessionBusyError("Cannot list files while the session is running")
-        async with lock:
-            record = await self.get(session_id)
-            if record.state is SessionState.DELETED:
-                raise SessionDeletedError(session_id)
-            context = await self._context(record)
+        record = await self.get(session_id)
+        if record.state is SessionState.DELETED:
+            raise SessionDeletedError(session_id)
+        context = await self._context(record)
 
-            def scan() -> list[dict[str, object]]:
-                visible: list[dict[str, object]] = []
-                for path in sorted(context.workspace.rglob("*")):
-                    if path.is_symlink() or not path.is_file():
+        def scan() -> list[dict[str, object]]:
+            root = context.workspace.resolve()
+            visible: list[dict[str, object]] = []
+            for directory, dirnames, filenames in os.walk(
+                root, topdown=True, onerror=lambda _error: None, followlinks=False
+            ):
+                directory_path = Path(directory)
+                kept_directories: list[str] = []
+                for name in dirnames:
+                    if name.startswith(".") or name == "__pycache__":
                         continue
-                    relative = path.relative_to(context.workspace)
-                    if (
-                        any(
+                    try:
+                        if (directory_path / name).is_symlink():
+                            continue
+                    except OSError:
+                        continue
+                    kept_directories.append(name)
+                dirnames[:] = sorted(kept_directories)
+                for name in sorted(filenames):
+                    if name.startswith(".") or name.endswith(".pyc"):
+                        continue
+                    path = directory_path / name
+                    try:
+                        relative = path.relative_to(root)
+                        if any(
                             part.startswith(".") or part == "__pycache__" for part in relative.parts
-                        )
-                        or path.suffix == ".pyc"
-                    ):
+                        ):
+                            continue
+                        if path.is_symlink():
+                            continue
+                        resolved = path.resolve(strict=True)
+                        if not resolved.is_relative_to(root):
+                            continue
+                        metadata = path.stat(follow_symlinks=False)
+                    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+                        # Agent tools may create, rename, or remove entries while
+                        # this observational scan is in progress.
                         continue
-                    visible.append({"path": relative.as_posix(), "size": path.stat().st_size})
-                return visible
+                    if stat.S_ISREG(metadata.st_mode):
+                        visible.append({"path": relative.as_posix(), "size": metadata.st_size})
+            return sorted(visible, key=lambda item: str(item["path"]))
 
-            return await asyncio.to_thread(scan)
+        return await asyncio.to_thread(scan)
 
-    async def file_path(self, session_id: str, file_path: str) -> tuple[Path, str]:
-        """Return an existing user-visible file from this session's workspace."""
+    @staticmethod
+    def _normalize_visible_file_path(file_path: str) -> tuple[tuple[str, ...], str]:
+        portable_path = file_path.replace("\\", "/")
+        path_segments = portable_path.split("/")
+        relative = PurePosixPath(portable_path)
+        if (
+            not portable_path
+            or not relative.parts
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in path_segments)
+            or any(part.startswith(".") or part == "__pycache__" for part in path_segments)
+            or relative.name.endswith(".pyc")
+        ):
+            raise InvalidWorkspacePathError(f"Invalid workspace path: {file_path!r}")
+        return relative.parts, relative.as_posix()
+
+    @staticmethod
+    def _open_workspace_file(workspace: Path, file_path: str) -> OpenedWorkspaceFile:
+        parts, normalized = SessionService._normalize_visible_file_path(file_path)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+        def translate_open_error(exc: OSError, parent_fd: int, name: str) -> NoReturn:
+            if exc.errno == errno.ELOOP:
+                raise InvalidWorkspacePathError(
+                    f"Workspace file paths cannot contain symbolic links: {normalized!r}"
+                ) from None
+            if exc.errno == errno.ENOTDIR:
+                try:
+                    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    metadata = None
+                if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                    raise InvalidWorkspacePathError(
+                        f"Workspace file paths cannot contain symbolic links: {normalized!r}"
+                    ) from None
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ESTALE}:
+                raise SessionNotFoundError(f"Workspace file does not exist: {normalized}") from None
+            raise SessionServiceError(f"Could not open workspace file: {normalized}") from exc
+
+        try:
+            directory_fd = os.open(workspace, directory_flags)
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ESTALE}:
+                raise SessionNotFoundError(f"Workspace file does not exist: {normalized}") from None
+            if exc.errno == errno.ELOOP:
+                raise InvalidWorkspacePathError(
+                    "Workspace root cannot be a symbolic link"
+                ) from None
+            raise SessionServiceError(f"Could not open workspace file: {normalized}") from exc
+
+        try:
+            for part in parts[:-1]:
+                try:
+                    next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    translate_open_error(exc, directory_fd, part)
+                os.close(directory_fd)
+                directory_fd = next_fd
+
+            try:
+                file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+            except OSError as exc:
+                translate_open_error(exc, directory_fd, parts[-1])
+            try:
+                metadata = os.fstat(file_fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise SessionNotFoundError(f"Workspace file does not exist: {normalized}")
+                return OpenedWorkspaceFile(file_fd, normalized)
+            except BaseException:
+                os.close(file_fd)
+                raise
+        finally:
+            os.close(directory_fd)
+
+    async def open_file(self, session_id: str, file_path: str) -> OpenedWorkspaceFile:
+        """Open one visible regular file without taking the session turn lock."""
+        record = await self.get(session_id)
+        if record.state is SessionState.DELETED:
+            raise SessionDeletedError(session_id)
+        context = await self._context(record)
+        return await asyncio.to_thread(self._open_workspace_file, context.workspace, file_path)
+
+    @staticmethod
+    def _editor_language(path: str, mime_type: str) -> str:
+        suffix = PurePosixPath(path).suffix.lower()
+        languages = {
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".json": "json",
+            ".html": "html",
+            ".htm": "html",
+            ".css": "css",
+            ".md": "markdown",
+            ".sh": "shell",
+            ".bash": "shell",
+            ".yml": "yaml",
+            ".yaml": "yaml",
+            ".xml": "xml",
+            ".sql": "sql",
+            ".java": "java",
+            ".c": "c",
+            ".h": "c",
+            ".cpp": "cpp",
+            ".cc": "cpp",
+            ".go": "go",
+            ".rs": "rust",
+            ".rb": "ruby",
+            ".php": "php",
+            ".toml": "toml",
+        }
+        if suffix in languages:
+            return languages[suffix]
+        if mime_type in {"application/json", "application/xml"}:
+            return "json" if mime_type == "application/json" else "xml"
+        return "plaintext"
+
+    @staticmethod
+    def _is_text_content(content: bytes) -> bool:
+        if not content:
+            return True
+        if b"\0" in content:
+            return False
+        try:
+            decoded = content.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        controls = sum(
+            (ord(char) < 32 and char not in "\n\r\t")
+            or ord(char) == 0x7F
+            or 0x80 <= ord(char) <= 0x9F
+            for char in decoded
+        )
+        return controls / max(len(decoded), 1) <= 0.02
+
+    async def inspect_editor_file(
+        self, session_id: str, file_path: str, *, max_editor_bytes: int
+    ) -> dict[str, object]:
+        """Classify a safely opened inode for the text editor without a turn lock."""
+        if max_editor_bytes <= 0:
+            raise ValueError("max_editor_bytes must be positive")
+        opened = await self.open_file(session_id, file_path)
+        try:
+            metadata = opened.stat()
+            mime_type = (
+                mimetypes.guess_type(opened.normalized_path)[0] or "application/octet-stream"
+            )
+            language = self._editor_language(opened.normalized_path, mime_type)
+            # A bounded sample is enough to reject obvious binary data; never return
+            # large content or a revision that could later be mistaken for editable.
+            sample_limit = (
+                max_editor_bytes + 1
+                if metadata.st_size <= max_editor_bytes
+                else min(max_editor_bytes, 64 * 1024)
+            )
+            content = await asyncio.to_thread(opened.read_all, sample_limit)
+            base = {
+                "path": opened.normalized_path,
+                "size": metadata.st_size,
+                "mime_type": mime_type,
+                "language": language,
+                "max_editor_bytes": max_editor_bytes,
+            }
+            if metadata.st_size > max_editor_bytes or len(content) > max_editor_bytes:
+                return {
+                    **base,
+                    "kind": "text" if self._is_text_content(content) else "binary",
+                    "editable": False,
+                    "reason": "too_large",
+                }
+            if not self._is_text_content(content):
+                return {**base, "kind": "binary", "editable": False, "reason": "binary"}
+            return {
+                **base,
+                "kind": "text",
+                "editable": True,
+                "reason": None,
+                "content": content.decode("utf-8"),
+                "revision": hashlib.sha256(content).hexdigest(),
+            }
+        finally:
+            opened.close()
+
+    @staticmethod
+    def _editor_digest(source_fd: int, max_bytes: int) -> str:
+        """Hash an editor file with a hard read bound, never buffering it all."""
+        metadata = os.fstat(source_fd)
+        if metadata.st_size > max_bytes:
+            raise FileTooLargeError("Existing file exceeds the editor file-size limit")
+        digest = hashlib.sha256()
+        total = 0
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while chunk := os.read(source_fd, min(64 * 1024, max_bytes + 1 - total)):
+            total += len(chunk)
+            if total > max_bytes:
+                raise FileTooLargeError("Existing file exceeds the editor file-size limit")
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    def _replace_editor_file(
+        self,
+        workspace: Path,
+        file_path: str,
+        content: bytes,
+        expected: str,
+        force: bool,
+        max_editor_bytes: int,
+    ) -> dict[str, object]:
+        """Atomically replace a visible regular file using descriptor-relative paths."""
+        parts, normalized = SessionService._normalize_visible_file_path(file_path)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+        def open_checked(name: str, flags: int, parent_fd: int) -> int:
+            try:
+                return os.open(name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise InvalidWorkspacePathError(
+                        f"Workspace file paths cannot contain symbolic links: {normalized!r}"
+                    ) from None
+                if exc.errno == errno.ENOTDIR:
+                    try:
+                        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except OSError:
+                        metadata = None
+                    if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                        raise InvalidWorkspacePathError(
+                            f"Workspace file paths cannot contain symbolic links: {normalized!r}"
+                        ) from None
+                if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ESTALE}:
+                    raise SessionNotFoundError(
+                        f"Workspace file does not exist: {normalized}"
+                    ) from None
+                raise SessionServiceError(f"Could not open workspace file: {normalized}") from exc
+
+        try:
+            directory_fd = os.open(workspace, directory_flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise InvalidWorkspacePathError(
+                    "Workspace root cannot be a symbolic link"
+                ) from None
+            raise SessionServiceError(f"Could not open workspace file: {normalized}") from exc
+        temporary_name: str | None = None
+        try:
+            for part in parts[:-1]:
+                next_fd = open_checked(part, directory_flags, directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            source_fd = open_checked(parts[-1], file_flags, directory_fd)
+            try:
+                metadata = os.fstat(source_fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise SessionNotFoundError(f"Workspace file does not exist: {normalized}")
+                actual = self._editor_digest(source_fd, max_editor_bytes)
+                if actual != expected and not force:
+                    raise FileChangedError("The file changed since it was opened")
+            finally:
+                os.close(source_fd)
+            temporary_name = f".webagent-editor-{os.getpid()}-{time.time_ns()}"
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                stat.S_IMODE(metadata.st_mode),
+                dir_fd=directory_fd,
+            )
+            try:
+                written = 0
+                while written < len(content):
+                    written += os.write(temporary_fd, content[written:])
+                os.fchmod(temporary_fd, stat.S_IMODE(metadata.st_mode))
+                os.fsync(temporary_fd)
+                temporary_metadata = os.fstat(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            # The temporary inode is now durable.  Make the last observation
+            # of the visible path immediately before the replacement, so a
+            # concurrent rename during hashing or temporary-file creation is
+            # rejected instead of overwritten.
+            visible = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+            if (visible.st_dev, visible.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise FileChangedError("The file was replaced while it was being saved")
+            if self._editor_revision_checked_hook is not None:
+                self._editor_revision_checked_hook()
+            _rename_exchange(directory_fd, temporary_name, parts[-1])
+            displaced = os.stat(temporary_name, dir_fd=directory_fd, follow_symlinks=False)
+            if (displaced.st_dev, displaced.st_ino) != (metadata.st_dev, metadata.st_ino):
+                # The name changed after the last observation.  The exchange
+                # preserved that inode under temporary_name, so restore it
+                # instead of losing it to an unconditional replacement.
+                current = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (
+                    temporary_metadata.st_dev,
+                    temporary_metadata.st_ino,
+                ):
+                    raise SessionServiceError("Editor target changed during atomic replacement")
+                _rename_exchange(directory_fd, temporary_name, parts[-1])
+                raise FileChangedError("The file was replaced while it was being saved")
+            os.unlink(temporary_name, dir_fd=directory_fd)
+            temporary_name = None
+            return {
+                "path": normalized,
+                "size": len(content),
+                "revision": hashlib.sha256(content).hexdigest(),
+            }
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ESTALE}:
+                raise SessionNotFoundError(f"Workspace file does not exist: {normalized}") from None
+            if exc.errno == errno.ELOOP:
+                raise InvalidWorkspacePathError(
+                    f"Workspace file paths cannot contain symbolic links: {normalized!r}"
+                ) from None
+            raise SessionServiceError(f"Could not replace workspace file: {normalized}") from exc
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+            os.close(directory_fd)
+
+    async def save_editor_file(
+        self,
+        session_id: str,
+        file_path: str,
+        *,
+        content: str,
+        expected_revision: str,
+        force: bool,
+        max_editor_bytes: int,
+    ) -> dict[str, object]:
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_editor_bytes:
+            raise FileTooLargeError("Text content exceeds the editor file-size limit")
         lock = self.locks.lock_for(session_id)
         if lock.locked():
-            raise SessionBusyError("Cannot read files while the session is running")
+            raise SessionBusyError("Cannot edit files while the session is running")
         async with lock:
             record = await self.get(session_id)
             if record.state is SessionState.DELETED:
                 raise SessionDeletedError(session_id)
             context = await self._context(record)
-            target, normalized = self._upload_target(context.workspace, file_path)
-
-            def resolve_file() -> Path:
-                if not target.is_file() or target.is_symlink():
-                    raise SessionNotFoundError(f"Workspace file does not exist: {normalized}")
-                return target
-
-            return await asyncio.to_thread(resolve_file), normalized
+            return await asyncio.to_thread(
+                self._replace_editor_file,
+                context.workspace,
+                file_path,
+                encoded,
+                expected_revision,
+                force,
+                max_editor_bytes,
+            )
 
     async def get(self, session_id: str) -> SessionRecord:
         record = await self.repository.get(session_id)

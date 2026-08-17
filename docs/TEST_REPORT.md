@@ -1,23 +1,10 @@
-# v0.3.0 测试报告
+# 测试指南
 
-> 当前发布矩阵；历史阶段性数字、真实 Endpoint、机器地址、进程信息和提交哈希已移除。
+本页记录 WebAgent 浏览器路线的验证范围与运行前提。2026-08-17 当前工作树的 unit + e2e（非 browser）为 **179 passed、1 warning**；Chromium 浏览器套件为 **50 passed、1 skipped**，跳过项是当前 Linux 主机缺失 WebKit 运行依赖；`@codex` 事件、授权、model/effort 选择和持久 Session wrapper 为 **20 passed**。本轮未重跑 Docker integration；发布前仍应在目标分支执行下方完整矩阵。
 
-## 结果
+## 运行检查
 
-| 门禁 | 当前结果 | 覆盖重点 |
-|---|---:|---|
-| Python 全套 | **193 passed, 1 skipped, 1 warning** | unit、E2E、browser、Docker integration |
-| Browser 专项 | **34 passed, 1 skipped** | Chromium 全链、窄屏设置入口与 WebKit smoke |
-| 前端 protocol | **3 passed** | replay/live reducer 与事件隔离 |
-| Docker integration | **5 passed** | worker 镜像、跨 UID workspace、执行、隔离与清理合同 |
-| npm audit | **0 vulnerabilities** | 当前 lockfile 依赖审计 |
-| Fake/local curl smoke | **passed** | OpenAI-compatible SSE、两轮 Session、文件与生命周期 |
-
-唯一 skip 是当前 Linux 测试环境缺少 Playwright WebKit 所需宿主动态库。Chromium 测试通过；该 skip 不等价于真实 macOS Safari 已验证。
-
-## 从新机器运行
-
-先安装锁定的开发依赖。基础 Python 套件不要求浏览器引擎或 worker 镜像：
+先安装锁定的开发依赖，再运行基础 Python 检查：
 
 ```bash
 uv sync --locked --dev
@@ -27,7 +14,7 @@ uv lock --check
 uv run pytest -q -m "not integration" --ignore=tests/browser
 ```
 
-前端检查与 browser 专项分别运行；安装 browser 前显式安装 Chromium、WebKit 及其系统依赖：
+前端检查与浏览器专项分别运行。安装浏览器时显式安装 Chromium、WebKit 及其系统依赖：
 
 ```bash
 cd frontend
@@ -38,19 +25,6 @@ npm audit
 cd ..
 uv run playwright install --with-deps chromium webkit
 uv run pytest -q tests/browser
-```
-
-Fake/local curl smoke 不要求 Docker，但客户端脚本不会替你启动或配置服务。先在终端 1 启动明确使用 Fake runtime 和 Local sandbox 的隔离服务：
-
-```bash
-RUNTIME_BACKEND=fake SANDBOX_BACKEND=local \
-  uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-保持服务运行，再在终端 2 执行客户端 smoke：
-
-```bash
-./scripts/smoke_curl.sh
 ```
 
 代码和文档格式检查可独立执行：
@@ -68,27 +42,28 @@ uv run pytest -q -m integration tests/integration
 
 ## CI 策略
 
-每次 push 和 Pull Request 都运行：
-
-- Python lock、format、lint 和非 Docker/非 browser 测试；
-- 前端 dependency audit、format、protocol tests、production build 与 committed bundle 检查；
-- wheel build、干净环境安装及 bundled web assets 验证；
-- 安装 Chromium/WebKit 后运行 browser suite。
+每次 push 和 Pull Request 都运行 Python lock、format、lint 和非 Docker/非 browser 测试；前端 dependency audit、format、protocol tests、production build 与 committed bundle 检查；wheel build、干净环境安装及 bundled web assets 验证；以及安装 Chromium/WebKit 后的 browser suite。
 
 Docker integration 会构建 worker 镜像，只在手工 `workflow_dispatch` 和已发布 Release 事件中运行，避免普通 push/PR 隐含依赖 Docker release 环境。
 
 ## 关键验收范围
 
 - Session create/list/get/update/pause/resume/delete、墓碑、workspace 与 Transcript 连续性。
-- OpenAI-compatible blocking/SSE、错误收尾和 Fake 两轮文件任务。
-- Web Provider 的 Test → model/effort → Save、Bearer/`x-api-key`、错误恢复与动态 ID 目录。
+- Session 右键/键盘菜单重命名、运行中改名、错误保稿、焦点恢复，以及手动标题相对自动标题和旧列表响应的持久化顺序。
+- 后台用户预建/启停、姓名规范化验证、Session owner、REST/WS 跨用户隔离、登出与同浏览器 Provider 用户命名空间。
+- 管理后台分区导航、概览、用户和 Session 列表、managed settings CAS、无效生命周期配置拒绝与重启生效。
+- 轻量运维监控：有界历史、主机/进程/容器负载、组件健康、后台任务、Journal/Reaper 停滞、生命周期 pending 与 Session/容器一致性；页面隐藏或离开监控分区后停止轮询。
+- Web Provider 的 Test → model/effort → Save、Bearer/`x-api-key`、动态 ID 目录，以及无 Session 心跳、链路中断与自动恢复。
 - 应用持有的 turn：断开/关闭页面后继续、重连 replay/live 无遗漏无重复、真实 stop、服务 shutdown 取消。
 - 多 Session 并行和事件/stop 隔离；同一 Session busy 合同。
 - completed/failed/stopped history、Journal FIFO、SQLite 瞬时失败与 invariant 冲突隔离。
 - Docker worker non-root、资源/网络配置、命令终止、orphan cleanup 与 workspace 隔离。
-- 文件/目录上传、树形展示与统一双击下载。
+- 文件/目录上传与树形展示；UTF-8/二进制/大文件识别、语法高亮、revision 冲突与强制覆盖、运行中只读，以及安全下载。
+- 单文件 2 MiB 边界、超限批次无部分写入、Session 累计上传计数/并发序列化，以及第 10 个后桌面与抽屉上传入口置灰。
 - 桌面三栏、边栏拖拽/折叠、窄屏抽屉、低高度 composer、键盘 listbox 和无 page error。
 - Diagnostic log 与 Transcript 分层；Provider 配置/Key 不进入 Session metadata、Transcript 或 diagnostic SQLite，目录失败 warning 只含脱敏 Endpoint、auth mode 和 Key 短 hash fingerprint；raw 任务命令/输出仍保留完整排障语义。
+- Session 日志的用户/Assistant/工具/Bash/result 顺序、真实 runner → runtime → SQLite/HTML 字段贯通、常见凭据遮罩、刷新和跨 Session 请求隔离，以及 1440/820/390 视口独立滚动。
+- `@codex` event parser 的 Issue、评论、PR、Review、行内评论、公开 owner/allowlist/拒绝、bot 与缺失 visibility；持久 Session 首次创建/显式 ID resume 和 model/effort classifier 隔离。
 
 ## 未由该矩阵证明
 

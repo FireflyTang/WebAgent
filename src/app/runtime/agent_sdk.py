@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
-from .base import ProviderConfig, RuntimeContext
+from .base import RuntimeContext
 from .events import Completed, Diagnostic, Failed, Progress, RuntimeEvent, TextDelta, Usage
 
 RunnerLine: TypeAlias = str | bytes
@@ -26,28 +26,14 @@ class AgentSdkExecutor(Protocol):
 class AgentSDKRuntime:
     """Map stable runner NDJSON to runtime events without importing the SDK on the host."""
 
-    _allowed_auth_envs = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
-    _openai_compat_model = "claude-code-agent"
-
     def __init__(
         self,
-        api_key: str | None,
         *,
-        base_url: str | None = None,
-        model: str | None = None,
-        auth_env: str = "ANTHROPIC_API_KEY",
         runner_command: str = "/usr/local/bin/oca-agent-sdk-runner",
         executor: AgentSdkExecutor,
     ) -> None:
-        if auth_env not in self._allowed_auth_envs:
-            allowed = ", ".join(sorted(self._allowed_auth_envs))
-            raise ValueError(f"auth_env must be one of: {allowed}")
         if not runner_command:
             raise ValueError("runner_command must not be empty")
-        self.api_key = api_key or None
-        self.base_url = base_url.rstrip("/") if base_url else None
-        self.model = model
-        self.auth_env = auth_env
         self.runner_command = runner_command
         self.executor = executor
         self._states: dict[str, str] = {}
@@ -72,7 +58,9 @@ class AgentSDKRuntime:
             "NODE_EXTRA_CA_CERTS",
         )
         env = {name: os.environ[name] for name in inherited if os.environ.get(name)}
-        provider = self._provider_for(context)
+        provider = context.provider
+        if provider is None:
+            raise RuntimeError("A provider API credential is required")
         if not provider.api_key:
             raise RuntimeError("A provider API credential is required")
         env[provider.auth_env] = provider.api_key
@@ -82,18 +70,6 @@ class AgentSDKRuntime:
             env["ANTHROPIC_BASE_URL"] = provider.base_url
         return env
 
-    def _provider_for(self, context: RuntimeContext) -> ProviderConfig:
-        return context.provider or ProviderConfig(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            auth_env=self.auth_env,
-        )
-
-    def _model_for(self, context: RuntimeContext) -> str | None:
-        if context.model and context.model != self._openai_compat_model:
-            return context.model
-        return self.model
-
     def _command(
         self, *, message: str, context: RuntimeContext, runtime_session_id: str, resume: bool
     ) -> list[str]:
@@ -102,9 +78,8 @@ class AgentSDKRuntime:
             command.extend(["--resume", runtime_session_id])
         else:
             command.extend(["--session-id", runtime_session_id])
-        model = self._model_for(context)
-        if model:
-            command.extend(["--model", model])
+        if context.model:
+            command.extend(["--model", context.model])
         if context.effort:
             command.extend(["--effort", context.effort])
         if context.system_prompt:
@@ -128,7 +103,7 @@ class AgentSDKRuntime:
         if state == "closed":
             yield Failed("runtime_closed", "Runtime session is closed")
             return
-        if not self._provider_for(context).api_key:
+        if not context.provider or not context.provider.api_key:
             yield Failed("provider_credentials_missing", "Provider API credential is required")
             return
         completed = False
@@ -263,6 +238,10 @@ class AgentSDKRuntime:
                 ),
                 tool_input=tool_input if isinstance(tool_input, dict) else None,
                 tool_result=(tool_result if isinstance(tool_result, (str, dict, list)) else None),
+                is_error=(
+                    payload.get("is_error") if isinstance(payload.get("is_error"), bool) else None
+                ),
+                result=payload.get("result") if isinstance(payload.get("result"), str) else None,
                 visible_text=(
                     payload.get("visible_text")
                     if isinstance(payload.get("visible_text"), str)

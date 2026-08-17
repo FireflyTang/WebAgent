@@ -1,7 +1,7 @@
 """Session persistence, lifecycle primitives, and in-process locking."""
 
 from .locks import SessionLockRegistry, SessionLocks
-from .models import SessionRecord, SessionState, utc_now
+from .models import SessionRecord, SessionState, SessionTurnRequest, utc_now
 from .repository import (
     SessionAlreadyExistsError,
     SessionLogEntry,
@@ -30,6 +30,7 @@ __all__ = [
     "SessionRepositoryError",
     "SessionState",
     "SessionStateMachine",
+    "SessionTurnRequest",
     "SessionVersionConflictError",
     "can_transition",
     "touch",

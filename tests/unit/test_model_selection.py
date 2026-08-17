@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -10,10 +11,9 @@ from fastapi.testclient import TestClient
 
 from app.api import web as web_api
 from app.api.web import router as web_router
-from app.config import Settings
-from app.openai_compat.schemas import ChatCompletionRequest
 from app.runtime.events import TextDelta
 from app.runtime.model_catalog import ModelCatalog, ModelCatalogUnavailableError
+from app.sessions.models import SessionTurnRequest
 from app.sessions.service import SessionTurnCompleted
 
 
@@ -31,13 +31,13 @@ class CapturingUiEventRepository:
 
 class CapturingService:
     def __init__(self) -> None:
-        self.requests: list[ChatCompletionRequest] = []
+        self.requests: list[SessionTurnRequest] = []
         self.providers = []
         self.efforts = []
         self.repository = CapturingUiEventRepository()
 
     async def stream_events(
-        self, request: ChatCompletionRequest, session_id: str, *, provider=None, effort=None
+        self, request: SessionTurnRequest, session_id: str, *, provider=None, effort=None
     ) -> AsyncIterator[TextDelta | SessionTurnCompleted]:
         del session_id
         self.requests.append(request)
@@ -51,20 +51,8 @@ class CapturingService:
         return events()
 
 
-def test_settings_normalizes_provider_model_list_and_default() -> None:
-    settings = Settings(
-        runtime_backend="claude",
-        claude_model="glm-4.7",
-        claude_available_models=" glm-4.7, glm-5-turbo,glm-5.2,glm-4.7, , ",
-    )
-
-    assert settings.selectable_models == ("glm-4.7", "glm-5-turbo", "glm-5.2")
-    assert settings.default_web_model == "glm-4.7"
-    assert settings.model_catalog_fallback_models == ("glm-4.7", "glm-5-turbo", "glm-5.2")
-
-
 @pytest.mark.asyncio
-async def test_model_catalog_fetches_caches_and_uses_auth_env() -> None:
+async def test_model_catalog_discovers_caches_and_uses_auth_env() -> None:
     calls = 0
     now = 100.0
 
@@ -80,57 +68,31 @@ async def test_model_catalog_fetches_caches_and_uses_auth_env() -> None:
             api_key="key",
             base_url="https://provider.example/",
             auth_env="ANTHROPIC_API_KEY",
-            fallback_models=("fallback",),
             cache_seconds=300,
             client=client,
             clock=lambda: now,
         )
-        assert await catalog.models() == ("glm-4.7", "glm-5.2")
-        assert await catalog.models() == ("glm-4.7", "glm-5.2")
+        assert await catalog.discover() == ("glm-4.7", "glm-5.2")
+        assert await catalog.discover() == ("glm-4.7", "glm-5.2")
         now = 400.0
-        assert await catalog.models() == ("glm-4.7", "glm-5.2")
+        assert await catalog.discover() == ("glm-4.7", "glm-5.2")
     assert calls == 2
 
 
 @pytest.mark.asyncio
-async def test_model_catalog_uses_bearer_and_falls_back_on_provider_failure() -> None:
-    calls = 0
-
+async def test_model_catalog_uses_bearer_auth() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
         assert request.headers["authorization"] == "Bearer token"
-        return httpx.Response(503)
+        return httpx.Response(200, json={"data": [{"id": "provider-model"}]})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         catalog = ModelCatalog(
             api_key="token",
             base_url="https://provider.example",
             auth_env="ANTHROPIC_AUTH_TOKEN",
-            fallback_models=("glm-4.7", "manual-fallback"),
             client=client,
         )
-        assert await catalog.models() == ("glm-4.7", "manual-fallback")
-        assert await catalog.models() == ("glm-4.7", "manual-fallback")
-    assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_strict_discovery_does_not_substitute_fallback_models() -> None:
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda request: httpx.Response(503))
-    ) as client:
-        catalog = ModelCatalog(
-            api_key="token",
-            base_url="https://provider.example",
-            auth_env="ANTHROPIC_AUTH_TOKEN",
-            fallback_models=("deployment-fallback",),
-            client=client,
-        )
-        assert await catalog.models() == ("deployment-fallback",)
-        with pytest.raises(ModelCatalogUnavailableError, match="HTTP 状态 503") as failure:
-            await catalog.discover()
-    assert failure.value.endpoint == "https://provider.example/v1/models"
+        assert await catalog.discover() == ("provider-model",)
 
 
 @pytest.mark.asyncio
@@ -154,7 +116,6 @@ async def test_strict_discovery_reports_upstream_failure_reason(
             api_key="provider-secret",
             base_url="https://provider.example",
             auth_env="ANTHROPIC_AUTH_TOKEN",
-            fallback_models=(),
             client=client,
         )
         with pytest.raises(ModelCatalogUnavailableError, match=reason) as failure:
@@ -180,7 +141,6 @@ async def test_strict_discovery_timeout_is_retryable_and_can_recover() -> None:
             api_key="provider-secret",
             base_url="https://provider.example",
             auth_env="ANTHROPIC_AUTH_TOKEN",
-            fallback_models=(),
             client=client,
         )
         with pytest.raises(ModelCatalogUnavailableError, match="上游请求超时"):
@@ -193,11 +153,14 @@ async def test_strict_discovery_timeout_is_retryable_and_can_recover() -> None:
 def test_web_config_models_endpoint_and_websocket_forward_provider_model(
     monkeypatch, caplog
 ) -> None:
-    settings = Settings(
-        api_key="model-test-key",
+    settings = SimpleNamespace(
         runtime_backend="claude",
-        claude_model="glm-4.7",
-        claude_available_models="glm-4.7,glm-5-turbo,glm-5.2",
+        sandbox_backend="docker",
+        session_pause_after_seconds=1800,
+        session_delete_after_seconds=7200,
+        file_editor_max_bytes=2 * 1024 * 1024,
+        file_upload_max_bytes=2 * 1024 * 1024,
+        file_upload_max_files_per_session=10,
     )
     service = CapturingService()
     app = FastAPI()
@@ -206,11 +169,10 @@ def test_web_config_models_endpoint_and_websocket_forward_provider_model(
     catalog_instances = []
 
     class FakeCatalog:
-        def __init__(self, *, api_key, base_url, auth_env, fallback_models, **kwargs):
+        def __init__(self, *, api_key, base_url, auth_env, **kwargs):
             self.api_key = api_key
             self.base_url = base_url
             self.auth_env = auth_env
-            self.fallback_models = fallback_models
             catalog_instances.append(self)
 
         async def discover(self):
@@ -235,6 +197,11 @@ def test_web_config_models_endpoint_and_websocket_forward_provider_model(
     app.include_router(web_router)
 
     with TestClient(app) as client:
+        # The browser's scoped discovery route is the only model catalog API.
+        # The former public compatibility endpoints must stay absent.
+        assert client.get("/v1/models").status_code == 404
+        assert client.post("/v1/chat/completions", json={}).status_code == 404
+
         config = client.get("/v1/web/config")
         assert config.status_code == 200
         assert config.json() == {
@@ -246,6 +213,9 @@ def test_web_config_models_endpoint_and_websocket_forward_provider_model(
                 "delete_after_seconds": 7200,
                 "runtime": "claude",
                 "sandbox": "docker",
+                "file_editor_max_bytes": 2 * 1024 * 1024,
+                "file_upload_max_bytes": 2 * 1024 * 1024,
+                "file_upload_max_files_per_session": 10,
             },
         }
         models = client.post(

@@ -112,8 +112,10 @@ async def test_diagnostic_html_groups_noisy_sdk_events_and_keeps_key_events_orde
 
     document = await logger.read_diagnostics("diagnostic")
 
-    assert "诊断摘要" in document
-    assert "诊断事件：8 条" in document
+    assert "<h1>执行转录</h1>" in document
+    assert "本次执行" in document
+    assert "用户 1 · Assistant 0 · 工具 1 · 错误 1" in document
+    assert "关键类型" not in document
     assert "ordinary interaction" in document
     assert "高频 SDK 诊断批次：3 条" in document
     assert "<details class='diagnostic-batch'>" in document
@@ -139,6 +141,116 @@ async def test_diagnostic_html_groups_noisy_sdk_events_and_keeps_key_events_orde
     )
     assert document.index(f"<h2>#{result.sequence} ") < document.index(f"<h2>#{failure.sequence} ")
     assert not (tmp_path / "session-logs").exists()
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_header_and_real_mapper_shaped_tool_result(tmp_path: Path) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    logger = SessionHtmlLogger(repository)
+    session_id = "session-with-a-very-long-identifier-for-a-narrow-iframe"
+    await logger.append(session_id, title="用户消息", content="run command")
+    await append_runtime_debug(
+        logger,
+        session_id,
+        "sdk.tool_use",
+        {"tool_name": "Bash", "tool_use_id": "bash-1", "tool_input": {"command": "echo ok"}},
+    )
+    await append_runtime_debug(
+        logger,
+        session_id,
+        "sdk.tool_result",
+        {
+            "tool_name": "Bash",
+            "tool_use_id": "bash-1",
+            "is_error": True,
+            "tool_result": [{"type": "text", "text": "real SDK result"}],
+        },
+    )
+
+    document = await logger.read_diagnostics(session_id)
+
+    assert "Session：" not in document
+    assert "<h1>执行转录</h1>" in document
+    assert "session-with-a…row-iframe" in document
+    assert "@media(max-width:600px)" in document
+    assert "<script" not in document
+    assert "工具调用 · Bash" in document
+    assert "Bash 命令" in document and "echo ok" in document
+    assert "工具结果 · Bash" in document
+    assert "real SDK result" in document
+    assert "event-error" in document
+    assert "<details class='raw'><summary>原始 JSON</summary>" in document
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_natural_language_result_keywords_do_not_drive_error_semantics(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    logger = SessionHtmlLogger(repository)
+    await append_runtime_debug(
+        logger,
+        "result-status",
+        "sdk.result",
+        {
+            "is_error": False,
+            "result": "The word failed/error appears in a successful natural-language answer.",
+        },
+    )
+    await append_runtime_debug(
+        logger,
+        "result-status",
+        "sdk.result",
+        {"is_error": True, "result": "This is explicitly failed."},
+    )
+
+    document = await logger.read_diagnostics("result-status")
+
+    assert "successful natural-language answer" in document
+    assert "错误 1" in document
+    assert document.count("<section class='event-error'>") == 1
+    assert document.count("<section class='event-success'>") == 1
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_pure_assistant_metadata_is_batched_and_not_counted(tmp_path: Path) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    logger = SessionHtmlLogger(repository)
+    pure = await append_runtime_debug(
+        logger,
+        "assistant-shape",
+        "sdk.assistant",
+        {"usage": {"input_tokens": 1}, "subtype": "end_turn"},
+    )
+    document = await logger.read_diagnostics("assistant-shape")
+
+    assert "Assistant 0" in document
+    assert f"<h2>#{pure.sequence} 运行时诊断：sdk.assistant" not in document
+    assert "高频 SDK 诊断批次：1 条" in document
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_visible_assistant_sdk_entry_is_named_and_counted_as_transcript_output(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    logger = SessionHtmlLogger(repository)
+    visible = await append_runtime_debug(
+        logger,
+        "visible-assistant",
+        "sdk.assistant",
+        {"visible_text": "这里是用户可见回答", "subtype": "end_turn"},
+    )
+
+    document = await logger.read_diagnostics("visible-assistant")
+
+    assert "Assistant 1" in document
+    assert f"<h2>#{visible.sequence} Assistant 输出</h2>" in document
+    assert "运行时诊断：sdk.assistant（" not in document
     await repository.close()
 
 
@@ -189,7 +301,7 @@ async def test_debug_transcript_exposes_legacy_chat_and_complete_tool_values(
             "duration_api_ms": 900,
         },
     )
-    await logger.append(
+    assistant = await logger.append(
         "transcript",
         title="Claude Code 输出",
         content="测试完成",
@@ -199,7 +311,7 @@ async def test_debug_transcript_exposes_legacy_chat_and_complete_tool_values(
     document = await logger.read_diagnostics("transcript")
 
     assert "请运行测试" in document
-    assert "Claude Code 输出" in document
+    assert "Assistant 输出" in document
     assert "测试完成" in document
     assert "Bash 命令" in document
     assert "pytest -q &amp;&amp; echo done" in document
@@ -213,6 +325,9 @@ async def test_debug_transcript_exposes_legacy_chat_and_complete_tool_values(
     assert "最终 result / 用量 / 耗时" in document
     assert "1200" in document
     assert "原始 JSON" in document
+    assert "#1 用户输入" in document
+    assert f"#{assistant.sequence} Assistant 输出" in document
+    assert "<details class='transcript-detail tool-input'>" in document
     assert document.index("请运行测试") < document.index(f"<h2>#{tool_use.sequence} ")
     assert document.index(f"<h2>#{tool_use.sequence} ") < document.index(
         f"<h2>#{tool_result.sequence} "
@@ -220,5 +335,7 @@ async def test_debug_transcript_exposes_legacy_chat_and_complete_tool_values(
     assert document.index(f"<h2>#{tool_result.sequence} ") < document.index(
         f"<h2>#{result.sequence} "
     )
-    assert document.index(f"<h2>#{result.sequence} ") < document.rindex("Claude Code 输出")
+    assert document.index(f"<h2>#{result.sequence} ") < document.index(
+        f"<h2>#{assistant.sequence} Assistant 输出"
+    )
     await repository.close()

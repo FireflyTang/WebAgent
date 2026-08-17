@@ -105,6 +105,48 @@ class SQLiteSessionRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listed[1].title, "Archived")
         self.assertEqual(listed[1].last_model, "glm-4.7")
 
+    async def test_users_are_normalized_unique_and_can_be_disabled(self) -> None:
+        user = await self.repository.create_user("  Alice\tExample  ")
+
+        self.assertEqual(user.name, "Alice Example")
+        self.assertEqual(user.normalized_name, "alice example")
+        self.assertIsNotNone(await self.repository.find_user_by_name("alice example"))
+        with self.assertRaises(SessionAlreadyExistsError):
+            await self.repository.create_user("ＡＬＩＣＥ example")
+        with self.assertRaises(ValueError):
+            await self.repository.create_user(" \n ")
+        with self.assertRaises(ValueError):
+            await self.repository.create_user("bad\u200bname")
+
+        disabled = await self.repository.set_user_enabled(user.user_id, False)
+        self.assertFalse(disabled.enabled)
+        self.assertFalse((await self.repository.get_user(user.user_id)).enabled)
+
+    async def test_session_owner_filter_and_managed_settings_survive_reload(self) -> None:
+        owner = await self.repository.create_user("Owner")
+        await self.repository.create(SessionRecord(session_id="owned", owner_user_id=owner.user_id))
+        await self.repository.create(SessionRecord(session_id="legacy"))
+
+        self.assertEqual(
+            [record.session_id for record in await self.repository.list_sessions(owner.user_id)],
+            ["owned"],
+        )
+        initial = await self.repository.get_managed_settings()
+        updated = await self.repository.update_managed_settings(
+            {"docker_memory": "1g"}, expected_version=initial.version
+        )
+        self.assertEqual(updated.version, initial.version + 1)
+        with self.assertRaises(SessionVersionConflictError):
+            await self.repository.update_managed_settings(
+                {"docker_memory": "2g"}, expected_version=initial.version
+            )
+
+        await self.repository.close()
+        self.repository = SQLiteSessionRepository(Path(self.directory.name) / "sessions.db")
+        restored = await self.repository.get_managed_settings()
+        self.assertEqual(restored.values, {"docker_memory": "1g"})
+        self.assertEqual((await self.repository.get("owned")).owner_user_id, owner.user_id)
+
     async def test_ui_events_are_ordered_idempotent_and_survive_repository_restart(self) -> None:
         timestamp = "2026-08-11T08:00:00+00:00"
         first = await self.repository.append_ui_event(
@@ -199,7 +241,7 @@ class SessionStateMachineTests(unittest.TestCase):
                 claude_session_id="runtime",
                 metadata={"runtime_backend": "FakeRuntime"},
             )
-            old_runtime = current.with_metadata(runtime_backend="ZhipuRuntime")
+            legacy_runtime = current.with_metadata(runtime_backend="LegacyRuntime")
             old_sandbox = SessionRecord(
                 session_id="old-sandbox",
                 sandbox_id="oca-sandbox-123",
@@ -208,7 +250,9 @@ class SessionStateMachineTests(unittest.TestCase):
             )
 
             self.assertEqual(service.compatibility_view(current), (True, None))
-            self.assertEqual(service.compatibility_view(old_runtime), (False, "运行时后端不兼容"))
+            self.assertEqual(
+                service.compatibility_view(legacy_runtime), (False, "运行时后端不兼容")
+            )
             self.assertEqual(service.compatibility_view(old_sandbox), (False, "沙箱后端不兼容"))
 
 

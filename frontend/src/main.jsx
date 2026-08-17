@@ -23,6 +23,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import FilesPanel from "./components/FilesPanel.jsx";
+import FileEditorDialog from "./components/FileEditorDialog.jsx";
 import TaskCard, { MarkdownContent } from "./components/TaskCard.jsx";
 import {
   applyReadySnapshot,
@@ -35,6 +36,8 @@ import {
 import "./style.css";
 
 const STORAGE = {
+  userId: "webagent.user-id",
+  userName: "webagent.user-name",
   endpoint: "oca.provider-endpoint",
   providerKey: "oca.provider-api-key",
   auth: "oca.provider-auth-env",
@@ -46,6 +49,7 @@ const STORAGE = {
   lc: "oca.left-collapsed",
   rc: "oca.right-collapsed",
 };
+const userStorageKey = (userId, key) => `webagent.user.${userId}.${key}`;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_LABELS = {
   low: "低",
@@ -54,6 +58,7 @@ const EFFORT_LABELS = {
   xhigh: "极高",
   max: "最高",
 };
+const PROVIDER_HEARTBEAT_MS = 15_000;
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const parseTime = (value) => (value ? Date.parse(value) : null);
 const titleOf = (s) => s?.title || s?.metadata?.title || "新会话";
@@ -69,6 +74,13 @@ const normalizedProvider = (value) => ({
 });
 const providerFingerprint = (value) =>
   JSON.stringify(normalizedProvider(value));
+const formatFileSize = (bytes) => {
+  const value = Number(bytes);
+  if (!Number.isFinite(value)) return "—";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} kB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+};
 const catalogModel = (catalog, preferred) => {
   const models = Array.isArray(catalog.models) ? catalog.models : [];
   return models.includes(preferred)
@@ -93,6 +105,10 @@ function IconButton({ label, children, className = "", ...props }) {
 
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
+  if (/^\/v1\/sessions(?:\/|$)/.test(path)) {
+    const userId = localStorage.getItem(STORAGE.userId);
+    if (userId) headers.set("X-WebAgent-User-ID", userId);
+  }
   const response = await fetch(path, { ...options, headers });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
@@ -100,6 +116,12 @@ async function request(path, options = {}) {
       data.detail || data.error?.message || `HTTP ${response.status}`,
     );
     error.status = response.status;
+    error.code = data.error?.code || data.code;
+    if (
+      (error.status === 401 || error.status === 403) &&
+      /^\/v1\/sessions(?:\/|$)/.test(path)
+    )
+      window.dispatchEvent(new Event("webagent:identity-invalid"));
     throw error;
   }
   return response;
@@ -271,6 +293,7 @@ function lifecycle(session) {
 }
 
 function SessionRail({
+  user,
   sessions,
   tasks,
   activeId,
@@ -293,7 +316,7 @@ function SessionRail({
         </span>
         <div>
           <strong>WebAgent</strong>
-          <small>@Username</small>
+          <small>{user.name}</small>
         </div>
       </div>
       <button
@@ -324,6 +347,13 @@ function SessionRail({
                   aria-current={s.session_id === activeId ? "page" : undefined}
                   onClick={() => onSelect(s.session_id)}
                   onContextMenu={(event) => onContextMenu(s, event)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === "ContextMenu" ||
+                      (event.shiftKey && event.key === "F10")
+                    )
+                      onContextMenu(s, event);
+                  }}
                 >
                   <strong>{titleOf(s)}</strong>
                   <span>
@@ -474,13 +504,13 @@ function Messages({
   );
 }
 
-function Dialog({ title, onClose, children, id }) {
+function Dialog({ title, onClose, children, id, closeDisabled = false }) {
   return (
     <div
       className="modal-backdrop"
       role="presentation"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (!closeDisabled && e.target === e.currentTarget) onClose();
       }}
     >
       <section
@@ -492,7 +522,7 @@ function Dialog({ title, onClose, children, id }) {
       >
         <header>
           <h2 id={`${id}-title`}>{title}</h2>
-          <IconButton label="关闭" onClick={onClose}>
+          <IconButton label="关闭" onClick={onClose} disabled={closeDisabled}>
             <X />
           </IconButton>
         </header>
@@ -502,15 +532,70 @@ function Dialog({ title, onClose, children, id }) {
   );
 }
 
-function App() {
+function SessionLogDialog({ log, refreshing, onClose, onRefresh }) {
+  const shortSessionId = log.sessionId.slice(0, 8);
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => event.target === event.currentTarget && onClose()}
+    >
+      <section
+        id="logDialog"
+        className="dialog session-log-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="logDialog-title"
+      >
+        <header className="session-log-header">
+          <div>
+            <h2 id="logDialog-title">{log.title} · Session 日志</h2>
+            <p id="logSessionId">Session {shortSessionId}</p>
+          </div>
+          <div className="session-log-actions">
+            <button
+              id="refreshLog"
+              type="button"
+              className="secondary-button"
+              onClick={onRefresh}
+              disabled={refreshing}
+            >
+              {refreshing ? "刷新中…" : "刷新"}
+            </button>
+            <IconButton label="关闭日志" onClick={onClose}>
+              <X />
+            </IconButton>
+          </div>
+        </header>
+        <div className="session-log-body">
+          <p className="dialog-note">
+            按实际执行顺序展示用户输入、模型输出、工具参数与结果。
+          </p>
+          <iframe
+            id="sessionLogFrame"
+            title={`${log.title} Session 详细诊断日志`}
+            sandbox=""
+            srcDoc={log.html}
+          />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function App({ user, onLogout }) {
+  const userValue = (key) =>
+    localStorage.getItem(userStorageKey(user.user_id, key));
+  const setUserValue = (key, value) =>
+    localStorage.setItem(userStorageKey(user.user_id, key), value);
   const initialProvider = {
-    base_url: localStorage.getItem(STORAGE.endpoint) || "",
-    api_key: localStorage.getItem(STORAGE.providerKey) || "",
-    auth_env: localStorage.getItem(STORAGE.auth) || "ANTHROPIC_AUTH_TOKEN",
+    base_url: userValue(STORAGE.endpoint) || "",
+    api_key: userValue(STORAGE.providerKey) || "",
+    auth_env: userValue(STORAGE.auth) || "ANTHROPIC_AUTH_TOKEN",
   };
-  const storedEffort = localStorage.getItem(STORAGE.defaultEffort) || "",
+  const storedEffort = userValue(STORAGE.defaultEffort) || "",
     initialDefaults = {
-      model: localStorage.getItem(STORAGE.defaultModel) || "",
+      model: userValue(STORAGE.defaultModel) || "",
       effort: EFFORTS.includes(storedEffort) ? storedEffort : "",
     };
   const [provider, setProvider] = useState(initialProvider);
@@ -537,6 +622,12 @@ function App() {
   const [policyOpen, setPolicyOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [logHtml, setLogHtml] = useState(null);
+  const [logRefreshing, setLogRefreshing] = useState(false);
+  const [editorFile, setEditorFile] = useState(null);
+  const [editorValue, setEditorValue] = useState("");
+  const [editorSaving, setEditorSaving] = useState(false);
+  const [editorConflict, setEditorConflict] = useState(null);
+  const [largeFile, setLargeFile] = useState(null);
   const [promptsBySession, setPromptsBySession] = useState({});
   const [drawer, setDrawer] = useState(false);
   const [sessionDrawer, setSessionDrawer] = useState(false);
@@ -553,6 +644,10 @@ function App() {
   const [draftDefaults, setDraftDefaults] = useState(initialDefaults);
   const [creationBusy, setCreationBusy] = useState(false);
   const [sessionMenu, setSessionMenu] = useState(null);
+  const [renameSession, setRenameSession] = useState(null);
+  const [renameTitle, setRenameTitle] = useState("");
+  const [renameError, setRenameError] = useState("");
+  const [renameSaving, setRenameSaving] = useState(false);
   const [leftWidth, setLeftWidth] = useState(
     () => Number(localStorage.getItem(STORAGE.left)) || 228,
   );
@@ -573,6 +668,7 @@ function App() {
     activeRef = useRef(activeId),
     previousActive = useRef(null),
     providerRef = useRef(provider),
+    sessionDefaultsRef = useRef(sessionDefaults),
     draftProviderRef = useRef(draftProvider),
     taskRef = useRef(tasks),
     messagesRef = useRef(messagesBySession),
@@ -583,23 +679,57 @@ function App() {
     attempts = useRef(new Map()),
     sessionLoadVersion = useRef(0),
     providerTestGeneration = useRef(0),
+    verifiedProviderFingerprint = useRef(null),
+    providerProbeGeneration = useRef(0),
     logGeneration = useRef(0),
     logAbort = useRef(null),
+    editorInstance = useRef(0),
+    editorTarget = useRef(null),
+    editorLoadGeneration = useRef(0),
+    editorSaveGeneration = useRef(0),
+    editorLoadAbort = useRef(null),
+    autoTitleRequests = useRef(new Map()),
+    renameInstance = useRef(0),
+    renameTarget = useRef(null),
     creationLock = useRef(false),
     conversationRef = useRef(null),
     followMessages = useRef(true);
   activeRef.current = activeId;
   providerRef.current = provider;
+  sessionDefaultsRef.current = sessionDefaults;
   draftProviderRef.current = draftProvider;
   taskRef.current = tasks;
   messagesRef.current = messagesBySession;
   taskHistoryRef.current = taskHistoryBySession;
   sessionsRef.current = sessions;
+  renameTarget.current = renameSession;
   const selected = sessions.find((s) => s.session_id === activeId);
   const activeTask = tasks[activeId];
   const running =
     CLIENT_WORKING_STATES.includes(activeTask?.status) ||
     SERVER_WORKING_STATES.includes(selected?.task_state);
+  const editorSessionRunning = Boolean(
+    editorFile &&
+      (CLIENT_WORKING_STATES.includes(tasks[editorFile.sessionId]?.status) ||
+        SERVER_WORKING_STATES.includes(
+          sessions.find(
+            (session) => session.session_id === editorFile.sessionId,
+          )?.task_state,
+        )),
+  );
+  const displayedEditorFile = editorFile
+    ? {
+        ...editorFile,
+        editable:
+          editorFile.editable &&
+          !editorSessionRunning &&
+          !editorFile.sessionBusy,
+        reason:
+          editorSessionRunning || editorFile.sessionBusy
+            ? "session_busy"
+            : editorFile.reason,
+      }
+    : null;
   const messages = messagesBySession[activeId] || [],
     taskHistory = taskHistoryBySession[activeId] || {};
   const connection = connections[activeId] || "disconnected";
@@ -607,6 +737,20 @@ function App() {
   const fileQuery = fileQueriesBySession[activeId] || "";
   const fileBusy = Boolean(fileBusyBySession[activeId]);
   const fileFeedback = fileFeedbackBySession[activeId] || "";
+  const uploadedFileCount = Math.max(
+    0,
+    Number(
+      selected?.uploaded_file_count ?? selected?.metadata?.uploaded_file_count,
+    ) || 0,
+  );
+  const fileUploadMaxBytes = Math.max(
+    0,
+    Number(config.policies?.file_upload_max_bytes) || 0,
+  );
+  const fileUploadMaxFiles = Math.max(
+    0,
+    Number(config.policies?.file_upload_max_files_per_session) || 0,
+  );
   const displayedError = sessionErrors[activeId] || error;
   const selectedModel = String(selected?.last_model || "");
   const selectedModelValid = Boolean(
@@ -661,11 +805,67 @@ function App() {
     logGeneration.current += 1;
     logAbort.current?.abort();
     logAbort.current = null;
+    setLogRefreshing(false);
     setLogHtml(null);
   }, []);
+  const closeRename = useCallback(
+    ({ force = false } = {}) => {
+      if (renameSaving && !force) return;
+      const sessionId = renameSession?.sessionId;
+      setRenameSession(null);
+      setRenameError("");
+      setRenameSaving(false);
+      if (sessionId)
+        requestAnimationFrame(() =>
+          document
+            .querySelector(`.session-row[data-session-id="${sessionId}"]`)
+            ?.focus(),
+        );
+    },
+    [renameSaving, renameSession],
+  );
+  const closeSessionMenu = useCallback(
+    ({ restoreFocus = false } = {}) => {
+      const sessionId = sessionMenu?.session_id;
+      setSessionMenu(null);
+      if (restoreFocus && sessionId)
+        requestAnimationFrame(() =>
+          document
+            .querySelector(`.session-row[data-session-id="${sessionId}"]`)
+            ?.focus(),
+        );
+    },
+    [sessionMenu],
+  );
+  const closeEditor = useCallback(() => {
+    if (editorFile && editorValue !== editorFile.content) {
+      if (!window.confirm("有未保存的修改，确定关闭编辑器吗？")) return;
+    }
+    editorInstance.current += 1;
+    editorTarget.current = null;
+    editorLoadGeneration.current += 1;
+    editorSaveGeneration.current += 1;
+    editorLoadAbort.current?.abort();
+    editorLoadAbort.current = null;
+    setEditorSaving(false);
+    setEditorFile(null);
+    setEditorConflict(null);
+  }, [editorFile, editorValue]);
   useEffect(() => {
     const escape = (e) => {
       if (e.key !== "Escape") return;
+      if (editorFile) {
+        closeEditor();
+        return;
+      }
+      if (largeFile) {
+        setLargeFile(null);
+        return;
+      }
+      if (renameSession) {
+        closeRename();
+        return;
+      }
       providerTestGeneration.current += 1;
       setProviderBusy(false);
       setSettings(false);
@@ -674,11 +874,19 @@ function App() {
       setPolicyOpen(false);
       setHelpOpen(false);
       closeLog();
-      setSessionMenu(null);
+      closeSessionMenu({ restoreFocus: true });
     };
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
-  }, [closeLog]);
+  }, [
+    closeEditor,
+    closeLog,
+    closeRename,
+    closeSessionMenu,
+    editorFile,
+    largeFile,
+    renameSession,
+  ]);
   useEffect(() => {
     closeLog();
   }, [activeId, closeLog]);
@@ -690,6 +898,12 @@ function App() {
     };
     document.addEventListener("pointerdown", close);
     return () => document.removeEventListener("pointerdown", close);
+  }, [sessionMenu]);
+  useEffect(() => {
+    if (!sessionMenu) return;
+    requestAnimationFrame(() =>
+      document.querySelector("#renameSessionMenuItem")?.focus(),
+    );
   }, [sessionMenu]);
   useEffect(() => {
     localStorage.setItem(STORAGE.left, String(leftWidth));
@@ -707,29 +921,37 @@ function App() {
   useEffect(() => {
     const candidate = normalizedProvider(provider),
       fingerprint = providerFingerprint(candidate),
-      generation = ++providerTestGeneration.current;
+      generation = ++providerProbeGeneration.current;
     if (!candidate.base_url || !candidate.api_key) {
       setProviderStatus("unconfigured");
       setSettings(true);
       return;
     }
-    setProviderStatus("loading");
-    request("/v1/web/models", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(candidate),
-    })
-      .then((r) => r.json())
-      .then((data) => {
+    const verified = verifiedProviderFingerprint.current === fingerprint;
+    setProviderStatus(verified ? "configured" : "loading");
+    let disposed = false,
+      inFlight = false,
+      hasSucceeded = verified,
+      timer = null;
+    const probe = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const data = await request("/v1/web/models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(candidate),
+        }).then((r) => r.json());
         if (
-          generation !== providerTestGeneration.current ||
+          disposed ||
+          generation !== providerProbeGeneration.current ||
           providerFingerprint(providerRef.current) !== fingerprint
         )
           return;
-        const model = catalogModel(data, initialDefaults.model),
-          defaults = { model, effort: initialDefaults.effort };
+        hasSucceeded = true;
+        const model = catalogModel(data, sessionDefaultsRef.current.model),
+          defaults = { model, effort: sessionDefaultsRef.current.effort };
         setSessionDefaults(defaults);
-        setDraftDefaults(defaults);
         setConfig((current) => ({
           ...current,
           ...data,
@@ -737,18 +959,30 @@ function App() {
           default_model: model,
         }));
         setProviderStatus("configured");
-      })
-      .catch((e) => {
+      } catch (e) {
         if (
-          generation !== providerTestGeneration.current ||
+          disposed ||
+          generation !== providerProbeGeneration.current ||
           providerFingerprint(providerRef.current) !== fingerprint
         )
           return;
-        setProviderStatus("failed");
-        setError(e.message);
-        setSettings(true);
-      });
-  }, []);
+        setProviderStatus(hasSucceeded ? "interrupted" : "failed");
+        if (!hasSucceeded) {
+          setError(e.message);
+          setSettings(true);
+        }
+      } finally {
+        inFlight = false;
+        if (!disposed) timer = setTimeout(probe, PROVIDER_HEARTBEAT_MS);
+      }
+    };
+    if (hasSucceeded) timer = setTimeout(probe, PROVIDER_HEARTBEAT_MS);
+    else probe();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [provider]);
 
   const loadSessions = useCallback(async (prefer) => {
     const version = ++sessionLoadVersion.current,
@@ -978,7 +1212,13 @@ function App() {
       let syncing = false;
       sockets.current.set(sid, ws);
       ws.onopen = () =>
-        ws.send(JSON.stringify({ type: "hello", session_id: sid }));
+        ws.send(
+          JSON.stringify({
+            type: "hello",
+            session_id: sid,
+            user_id: user.user_id,
+          }),
+        );
       ws.onmessage = (e) => {
         let event;
         try {
@@ -1066,6 +1306,7 @@ function App() {
       handleEvent,
       reduceIncoming,
       setSessionError,
+      user.user_id,
     ],
   );
   useEffect(() => {
@@ -1184,6 +1425,7 @@ function App() {
         return;
       const models = Array.isArray(catalog.models) ? catalog.models : [],
         model = catalogModel({ ...catalog, models }, sessionDefaults.model);
+      verifiedProviderFingerprint.current = fingerprint;
       setProviderTest({ ...catalog, models, fingerprint });
       setDraftDefaults({ model, effort: sessionDefaults.effort });
       if (!provider.base_url || !provider.api_key)
@@ -1207,11 +1449,11 @@ function App() {
     const candidate = normalizedProvider(draftProvider),
       defaults = { model: draftDefaults.model, effort: draftDefaults.effort },
       { fingerprint: _, ...catalog } = providerTest;
-    localStorage.setItem(STORAGE.endpoint, candidate.base_url);
-    localStorage.setItem(STORAGE.providerKey, candidate.api_key);
-    localStorage.setItem(STORAGE.auth, candidate.auth_env);
-    localStorage.setItem(STORAGE.defaultModel, defaults.model);
-    localStorage.setItem(STORAGE.defaultEffort, defaults.effort);
+    setUserValue(STORAGE.endpoint, candidate.base_url);
+    setUserValue(STORAGE.providerKey, candidate.api_key);
+    setUserValue(STORAGE.auth, candidate.auth_env);
+    setUserValue(STORAGE.defaultModel, defaults.model);
+    setUserValue(STORAGE.defaultEffort, defaults.effort);
     setProvider(candidate);
     setSessionDefaults(defaults);
     setConfig((current) => ({
@@ -1219,7 +1461,11 @@ function App() {
       ...catalog,
       default_model: defaults.model,
     }));
-    setProviderStatus("configured");
+    setProviderStatus(
+      verifiedProviderFingerprint.current === providerFingerprint(candidate)
+        ? "configured"
+        : "loading",
+    );
     setSettings(false);
     setError("");
   };
@@ -1266,13 +1512,60 @@ function App() {
   };
   const openSessionMenu = (session, event) => {
     event.preventDefault();
+    const targetBounds = event.currentTarget?.getBoundingClientRect?.();
+    const x = event.clientX || targetBounds?.left || 8;
+    const y = event.clientY || targetBounds?.bottom || 8;
     const width = 168,
-      height = 62;
+      height = 110;
     setSessionMenu({
       session_id: session.session_id,
-      x: clamp(event.clientX, 8, Math.max(8, window.innerWidth - width - 8)),
-      y: clamp(event.clientY, 8, Math.max(8, window.innerHeight - height - 8)),
+      x: clamp(x, 8, Math.max(8, window.innerWidth - width - 8)),
+      y: clamp(y, 8, Math.max(8, window.innerHeight - height - 8)),
     });
+  };
+  const openRenameSession = () => {
+    const id = sessionMenu?.session_id;
+    const session = sessionsRef.current.find((item) => item.session_id === id);
+    if (!session) return;
+    setSessionMenu(null);
+    setRenameSession({ sessionId: id, instance: ++renameInstance.current });
+    setRenameTitle(titleOf(session));
+    setRenameError("");
+  };
+  const submitRenameSession = async (event) => {
+    event.preventDefault();
+    const title = renameTitle.trim();
+    const target = renameSession;
+    const id = target?.sessionId;
+    if (!title) {
+      setRenameError("名称不能为空");
+      return;
+    }
+    if (!id) return;
+    setRenameSaving(true);
+    setRenameError("");
+    try {
+      const pendingAutoTitle = autoTitleRequests.current.get(id);
+      if (pendingAutoTitle) await pendingAutoTitle.promise;
+      if (
+        renameTarget.current?.sessionId !== id ||
+        renameTarget.current?.instance !== target.instance
+      )
+        return;
+      const updated = await request(`/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      }).then((response) => response.json());
+      sessionLoadVersion.current += 1;
+      setSessions((all) =>
+        all.map((session) => (session.session_id === id ? updated : session)),
+      );
+      closeRename({ force: true });
+    } catch (error) {
+      setRenameError(`重命名失败：${error.message}`);
+      setRenameSaving(false);
+    }
   };
   const deleteSession = async () => {
     const id = sessionMenu?.session_id;
@@ -1292,6 +1585,9 @@ function App() {
       return;
     }
     setSessionMenu(null);
+    const pendingAutoTitle = autoTitleRequests.current.get(id);
+    pendingAutoTitle?.controller.abort();
+    autoTitleRequests.current.delete(id);
     try {
       await request(`/v1/sessions/${encodeURIComponent(id)}`, {
         method: "DELETE",
@@ -1484,22 +1780,34 @@ function App() {
       connectSession(sid);
       return;
     }
-    if (!selected.title || selected.title === "新会话") {
-      request(`/v1/sessions/${encodeURIComponent(sid)}`, {
+    if (
+      (!selected.title || selected.title === "新会话") &&
+      !autoTitleRequests.current.has(sid)
+    ) {
+      const controller = new AbortController();
+      const entry = { controller, promise: null };
+      autoTitleRequests.current.set(sid, entry);
+      entry.promise = request(`/v1/sessions/${encodeURIComponent(sid)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           title: content.slice(0, 36),
           last_model: selectedModel,
         }),
       })
         .then((r) => r.json())
-        .then((updated) =>
+        .then((updated) => {
+          if (autoTitleRequests.current.get(sid) !== entry) return;
           setSessions((all) =>
             all.map((s) => (s.session_id === sid ? updated : s)),
-          ),
-        )
-        .catch(() => {});
+          );
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (autoTitleRequests.current.get(sid) === entry)
+            autoTitleRequests.current.delete(sid);
+        });
     }
   };
   const stop = () => {
@@ -1530,26 +1838,76 @@ function App() {
   const upload = async (list) => {
     const sid = activeRef.current;
     if (!sid || !list?.length) return;
+    const selectedFiles = Array.from(list);
+    const session = sessionsRef.current.find((item) => item.session_id === sid);
+    if (
+      CLIENT_WORKING_STATES.includes(taskRef.current[sid]?.status) ||
+      SERVER_WORKING_STATES.includes(session?.task_state)
+    ) {
+      setFileFeedbackBySession((all) => ({
+        ...all,
+        [sid]: "Agent 正在运行，暂不能上传文件",
+      }));
+      return;
+    }
+    const currentCount = Math.max(
+      0,
+      Number(
+        session?.uploaded_file_count ?? session?.metadata?.uploaded_file_count,
+      ) || 0,
+    );
+    const oversized = fileUploadMaxBytes
+      ? selectedFiles.filter((file) => file.size > fileUploadMaxBytes)
+      : [];
+    const reasons = [];
+    if (oversized.length) {
+      const names = oversized
+        .slice(0, 3)
+        .map((file) => file.name)
+        .join("、");
+      reasons.push(
+        `单文件上限为 ${formatFileSize(fileUploadMaxBytes)}，超限文件：${names}${
+          oversized.length > 3 ? ` 等 ${oversized.length} 个` : ""
+        }`,
+      );
+    }
+    if (
+      fileUploadMaxFiles &&
+      currentCount + selectedFiles.length > fileUploadMaxFiles
+    ) {
+      reasons.push(
+        `Session 最多上传 ${fileUploadMaxFiles} 个文件（当前 ${currentCount} 个，本次 ${selectedFiles.length} 个）`,
+      );
+    }
+    if (reasons.length) {
+      setFileFeedbackBySession((all) => ({
+        ...all,
+        [sid]: `未上传：${reasons.join("；")}`,
+      }));
+      return;
+    }
     setFileBusyBySession((all) => ({ ...all, [sid]: true }));
     setFileFeedbackBySession((all) => ({ ...all, [sid]: "正在上传…" }));
     try {
       const body = new FormData();
-      [...list].forEach((file) =>
+      selectedFiles.forEach((file) =>
         body.append("files", file, file.webkitRelativePath || file.name),
       );
       await request(`/v1/sessions/${encodeURIComponent(sid)}/files`, {
         method: "POST",
         body,
       });
-      await loadFiles(sid);
+      await Promise.all([loadFiles(sid), loadSessions(sid)]);
       setFileFeedbackBySession((all) => ({
         ...all,
-        [sid]: `已上传 ${list.length} 个文件`,
+        [sid]: `已上传 ${selectedFiles.length} 个文件`,
       }));
     } catch (e) {
       setFileFeedbackBySession((all) => ({
         ...all,
-        [sid]: `上传失败：${e.message}`,
+        [sid]: `上传失败：${
+          e.status === 413 ? e.message || "文件超过单文件上传上限" : e.message
+        }`,
       }));
     } finally {
       setFileBusyBySession((all) => ({ ...all, [sid]: false }));
@@ -1569,8 +1927,7 @@ function App() {
       }));
     }
   };
-  const openFile = async (path) => {
-    const sid = activeRef.current;
+  const downloadFile = async (sid, path) => {
     if (!sid) return;
     try {
       const encoded = path.split("/").map(encodeURIComponent).join("/"),
@@ -1599,14 +1956,245 @@ function App() {
       setSessionError(sid, e.message);
     }
   };
-  const openLog = async () => {
-    const sid = activeRef.current,
+  const openEditorFile = useCallback((sid, metadata) => {
+    setFileFeedbackBySession((all) => ({ ...all, [sid]: "" }));
+    setEditorFile({
+      ...metadata,
+      sessionId: sid,
+      content: metadata.content,
+      conflictRevision: null,
+    });
+    setEditorValue(metadata.content);
+    setEditorConflict(null);
+  }, []);
+  const loadEditorFile = async (sid, path, options = {}) => {
+    const {
+        preserveDraft = false,
+        currentInstance = editorInstance.current,
+        signal,
+      } = options,
+      encoded = path.split("/").map(encodeURIComponent).join("/"),
+      generation = ++editorLoadGeneration.current,
+      metadata = await request(
+        `/v1/sessions/${encodeURIComponent(sid)}/files/editor/${encoded}`,
+        { signal },
+      ).then((response) => response.json());
+    if (
+      generation !== editorLoadGeneration.current ||
+      currentInstance !== editorInstance.current ||
+      editorTarget.current?.sessionId !== sid ||
+      editorTarget.current?.path !== path
+    )
+      return false;
+    if (metadata.reason === "too_large") {
+      setLargeFile({ ...metadata, sessionId: sid });
+      return true;
+    }
+    if (metadata.kind === "binary") {
+      await downloadFile(sid, path);
+      return true;
+    }
+    if (typeof metadata.content !== "string")
+      throw new Error("服务端未返回可查看的文本内容");
+    if (preserveDraft)
+      setEditorFile((current) =>
+        current &&
+        current.sessionId === sid &&
+        current.path === path &&
+        currentInstance === editorInstance.current
+          ? {
+              ...current,
+              editable: true,
+              sessionBusy: false,
+              reason: metadata.reason,
+              size: metadata.size,
+              kind: metadata.kind,
+              language: metadata.language,
+              conflictRevision: current.conflictRevision,
+            }
+          : current,
+      );
+    else openEditorFile(sid, metadata);
+    return true;
+  };
+  const openFile = async (path) => {
+    const sid = activeRef.current;
+    if (!sid) return;
+    let controller = null;
+    try {
+      editorInstance.current += 1;
+      editorTarget.current = { sessionId: sid, path };
+      editorLoadAbort.current?.abort();
+      controller = new AbortController();
+      editorLoadAbort.current = controller;
+      await loadEditorFile(sid, path, {
+        currentInstance: editorInstance.current,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      setSessionError(sid, e.message);
+    } finally {
+      if (editorLoadAbort.current === controller)
+        editorLoadAbort.current = null;
+    }
+  };
+  const reloadEditorFile = async () => {
+    if (!editorFile) return;
+    let controller = null;
+    try {
+      editorLoadAbort.current?.abort();
+      controller = new AbortController();
+      const targetInstance = editorInstance.current;
+      editorTarget.current = {
+        sessionId: editorFile.sessionId,
+        path: editorFile.path,
+      };
+      editorLoadAbort.current = controller;
+      await loadEditorFile(editorFile.sessionId, editorFile.path, {
+        currentInstance: targetInstance,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      setSessionError(editorFile.sessionId, e.message);
+    } finally {
+      if (editorLoadAbort.current === controller)
+        editorLoadAbort.current = null;
+    }
+  };
+  const saveEditorFile = async (force) => {
+    if (!editorFile || !editorFile.editable || editorSaving) return;
+    const target = {
+      instance: editorInstance.current,
+      sessionId: editorFile.sessionId,
+      path: editorFile.path,
+    };
+    editorSaveGeneration.current += 1;
+    const saveGeneration = editorSaveGeneration.current;
+    setEditorSaving(true);
+    setFileFeedbackBySession((all) => ({
+      ...all,
+      [target.sessionId]: "",
+    }));
+    try {
+      const encoded = target.path.split("/").map(encodeURIComponent).join("/");
+      if (editorFile.conflictRevision && !force) {
+        const latest = await request(
+          `/v1/sessions/${encodeURIComponent(target.sessionId)}/files/editor/${encoded}`,
+        ).then((response) => response.json());
+        if (
+          saveGeneration !== editorSaveGeneration.current ||
+          target.instance !== editorInstance.current
+        )
+          return;
+        if (
+          latest.revision &&
+          latest.revision !== editorFile.conflictRevision
+        ) {
+          setEditorConflict(target);
+          return;
+        }
+      }
+      const saved = await request(
+        `/v1/sessions/${encodeURIComponent(target.sessionId)}/files/editor/${encoded}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: editorValue,
+            expected_revision:
+              editorFile.conflictRevision || editorFile.revision,
+            force,
+          }),
+        },
+      ).then((response) => response.json());
+      if (
+        saveGeneration !== editorSaveGeneration.current ||
+        target.instance !== editorInstance.current
+      )
+        return;
+      setEditorFile((current) =>
+        current &&
+        current.sessionId === target.sessionId &&
+        current.path === target.path
+          ? {
+              ...current,
+              ...saved,
+              content: editorValue,
+              editable: true,
+              conflictRevision: null,
+            }
+          : current,
+      );
+      setEditorConflict(null);
+      await loadFiles(target.sessionId);
+      setFileFeedbackBySession((all) => ({
+        ...all,
+        [target.sessionId]: "文件已保存",
+      }));
+    } catch (e) {
+      if (
+        saveGeneration !== editorSaveGeneration.current ||
+        target.instance !== editorInstance.current
+      )
+        return;
+      if (e.status === 409 && e.code === "file_changed")
+        setEditorConflict(target);
+      else if (e.status === 409 && e.code === "session_busy") {
+        setEditorFile((current) =>
+          current &&
+          current.sessionId === target.sessionId &&
+          current.path === target.path
+            ? {
+                ...current,
+                sessionBusy: true,
+                conflictRevision: current.conflictRevision || current.revision,
+              }
+            : current,
+        );
+        setFileFeedbackBySession((all) => ({
+          ...all,
+          [target.sessionId]:
+            "Agent 正在运行，草稿已保留；任务结束后可继续保存",
+        }));
+        loadSessions().catch(() => {});
+      } else setSessionError(target.sessionId, e.message);
+    } finally {
+      if (
+        saveGeneration === editorSaveGeneration.current &&
+        target.instance === editorInstance.current
+      )
+        setEditorSaving(false);
+    }
+  };
+  useEffect(() => {
+    if (!editorFile?.sessionBusy || editorSessionRunning) return;
+    const timer = setTimeout(() => {
+      setEditorFile((current) =>
+        current &&
+        current.sessionId === editorFile.sessionId &&
+        current.path === editorFile.path
+          ? { ...current, sessionBusy: false, editable: true }
+          : current,
+      );
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [
+    editorFile?.path,
+    editorFile?.sessionBusy,
+    editorFile?.sessionId,
+    editorSessionRunning,
+  ]);
+  const openLog = async (sessionId = activeRef.current) => {
+    const sid = sessionId,
       session = sessionsRef.current.find((item) => item.session_id === sid);
     if (!sid || !session) return;
     logAbort.current?.abort();
     const controller = new AbortController(),
       generation = ++logGeneration.current;
     logAbort.current = controller;
+    setLogRefreshing(true);
     try {
       const html = await request(
         `/v1/sessions/${encodeURIComponent(sid)}/log`,
@@ -1619,7 +2207,10 @@ function App() {
       if (e.name !== "AbortError" && generation === logGeneration.current)
         setSessionError(sid, e.message);
     } finally {
-      if (generation === logGeneration.current) logAbort.current = null;
+      if (generation === logGeneration.current) {
+        logAbort.current = null;
+        setLogRefreshing(false);
+      }
     }
   };
   const resize = (side, event) => {
@@ -1658,6 +2249,17 @@ function App() {
     setError("");
     setSettings(true);
   };
+  const logout = () => {
+    for (const timer of reconnectTimers.current.values()) clearTimeout(timer);
+    reconnectTimers.current.clear();
+    for (const [sid, ws] of sockets.current) {
+      closing.current.add(sid);
+      ws.close();
+    }
+    sockets.current.clear();
+    localStorage.removeItem(STORAGE.active);
+    onLogout();
+  };
   const displayedConnection =
     providerStatus === "unconfigured"
       ? "unconfigured"
@@ -1665,17 +2267,15 @@ function App() {
         ? "provider_failed"
         : providerStatus === "loading"
           ? "provider_loading"
-          : connection;
+          : providerStatus === "interrupted"
+            ? "provider_interrupted"
+            : "configured";
   const connCopy = {
-    connecting: "连接中",
-    connected: "已连接",
-    reconnecting: "重新连接",
-    auth_error: "认证失败",
-    disconnected: "未连接",
-    failed: "连接失败",
+    configured: "已连接",
     unconfigured: "未配置",
     provider_failed: "配置失败",
     provider_loading: "验证中",
+    provider_interrupted: "连接中断",
   }[displayedConnection];
   const life = lifecycle(selected);
   const deleteMinutes = selected?.delete_at
@@ -1703,6 +2303,7 @@ function App() {
       }}
     >
       <SessionRail
+        user={user}
         sessions={sessions}
         tasks={tasks}
         activeId={activeId}
@@ -1775,6 +2376,12 @@ function App() {
             {!selected && <p>新建 Session 后开始工作</p>}
           </div>
           <div className="connection-controls">
+            <div className="user-menu">
+              <span>{user.name}</span>
+              <button type="button" onClick={logout}>
+                登出
+              </button>
+            </div>
             <div
               id="connectionBadge"
               className={`connection-badge ${displayedConnection}`}
@@ -1982,7 +2589,7 @@ function App() {
               type="button"
               className="log-button"
               disabled={creationBusy || !selected}
-              onClick={openLog}
+              onClick={() => openLog()}
             >
               <FileText />
               查看 Session 日志
@@ -2100,6 +2707,9 @@ function App() {
         query={fileQuery}
         setQuery={setFileQuery}
         busy={fileBusy}
+        uploadDisabled={running}
+        uploadedFileCount={uploadedFileCount}
+        uploadLimit={fileUploadMaxFiles}
         feedback={fileFeedback}
         onRefresh={refreshFiles}
         onUpload={upload}
@@ -2112,8 +2722,17 @@ function App() {
           style={{ left: sessionMenu.x, top: sessionMenu.y }}
         >
           <button
+            id="renameSessionMenuItem"
             type="button"
             role="menuitem"
+            onClick={openRenameSession}
+          >
+            重命名
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="danger"
             disabled={menuWorking}
             onClick={deleteSession}
           >
@@ -2121,6 +2740,52 @@ function App() {
           </button>
           {menuWorking && <small>请先停止当前任务</small>}
         </div>
+      )}
+      {renameSession && (
+        <Dialog
+          id="renameSessionDialog"
+          title="重命名 Session"
+          onClose={closeRename}
+          closeDisabled={renameSaving}
+        >
+          <form className="rename-session-form" onSubmit={submitRenameSession}>
+            <label htmlFor="renameSessionTitle">名称</label>
+            <input
+              id="renameSessionTitle"
+              autoFocus
+              value={renameTitle}
+              maxLength="200"
+              disabled={renameSaving}
+              onChange={(event) => {
+                setRenameTitle(event.target.value);
+                if (renameError) setRenameError("");
+              }}
+            />
+            {renameError && (
+              <p className="rename-session-error" role="alert">
+                {renameError}
+              </p>
+            )}
+            <div className="editor-actions rename-session-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={closeRename}
+                disabled={renameSaving}
+              >
+                取消
+              </button>
+              <button
+                id="confirmRenameSession"
+                type="submit"
+                className="primary-button"
+                disabled={renameSaving || !renameTitle.trim()}
+              >
+                {renameSaving ? "正在保存…" : "确认"}
+              </button>
+            </div>
+          </form>
+        </Dialog>
       )}
       {drawer && (
         <div
@@ -2136,6 +2801,9 @@ function App() {
               query={fileQuery}
               setQuery={setFileQuery}
               busy={fileBusy}
+              uploadDisabled={running}
+              uploadedFileCount={uploadedFileCount}
+              uploadLimit={fileUploadMaxFiles}
               feedback={fileFeedback}
               onRefresh={refreshFiles}
               onUpload={upload}
@@ -2155,6 +2823,7 @@ function App() {
         >
           <div className="session-drawer">
             <SessionRail
+              user={user}
               sessions={sessions}
               tasks={tasks}
               activeId={activeId}
@@ -2177,30 +2846,94 @@ function App() {
           </div>
         </div>
       )}
-      {logHtml !== null && (
+      {editorFile && (
+        <FileEditorDialog
+          file={displayedEditorFile}
+          value={editorValue}
+          onChange={setEditorValue}
+          onClose={closeEditor}
+          onReload={reloadEditorFile}
+          onSave={saveEditorFile}
+          saving={editorSaving}
+        />
+      )}
+      {editorConflict && (
         <Dialog
-          id="logDialog"
-          title={`${logHtml.title} · Session 详细诊断日志 (${logHtml.sessionId})`}
-          onClose={closeLog}
+          id="editorConflictDialog"
+          title="文件已被修改"
+          onClose={() => setEditorConflict(null)}
         >
           <p className="dialog-note">
-            按实际执行顺序展示用户输入、模型输出、工具参数与结果。
+            文件已被 Agent
+            或其他页面修改。请选择重新加载最新内容，或确认仍然覆盖。
           </p>
-          <iframe
-            id="sessionLogFrame"
-            title={`${logHtml.title} Session 详细诊断日志`}
-            sandbox=""
-            srcDoc={logHtml.html}
-          />
-          <button
-            id="closeLog"
-            type="button"
-            className="secondary-button"
-            onClick={closeLog}
-          >
-            关闭
-          </button>
+          <div className="editor-actions conflict-actions">
+            <button
+              id="editorConflictReload"
+              type="button"
+              className="secondary-button"
+              onClick={reloadEditorFile}
+            >
+              重新加载
+            </button>
+            <button
+              id="editorConflictForce"
+              type="button"
+              className="primary-button"
+              onClick={() => saveEditorFile(true)}
+            >
+              仍然覆盖
+            </button>
+            <button
+              id="editorConflictCancel"
+              type="button"
+              className="secondary-button"
+              onClick={() => setEditorConflict(null)}
+            >
+              取消
+            </button>
+          </div>
         </Dialog>
+      )}
+      {largeFile && (
+        <Dialog
+          id="largeFileDialog"
+          title="文件过大，无法在编辑器中打开"
+          onClose={() => setLargeFile(null)}
+        >
+          <p className="dialog-note">
+            {largeFile.path} 大小为 {formatFileSize(largeFile.size)}
+            ，编辑器上限为 {formatFileSize(largeFile.max_editor_bytes)}。
+          </p>
+          <div className="editor-actions">
+            <button
+              id="largeFileDownload"
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                downloadFile(largeFile.sessionId, largeFile.path);
+                setLargeFile(null);
+              }}
+            >
+              下载
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setLargeFile(null)}
+            >
+              取消
+            </button>
+          </div>
+        </Dialog>
+      )}
+      {logHtml !== null && (
+        <SessionLogDialog
+          log={logHtml}
+          refreshing={logRefreshing}
+          onClose={closeLog}
+          onRefresh={() => openLog(logHtml.sessionId)}
+        />
       )}
       {policyOpen && (
         <Dialog
@@ -2248,4 +2981,106 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+function IdentityGate({ onVerified }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const verify = async (event) => {
+    event.preventDefault();
+    const candidate = name.trim();
+    if (!candidate || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const user = await request("/v1/users/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: candidate }),
+      }).then((response) => response.json());
+      localStorage.setItem(STORAGE.userId, user.user_id);
+      localStorage.setItem(STORAGE.userName, user.name);
+      onVerified(user);
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <main className="identity-page">
+      <form className="identity-card" onSubmit={verify}>
+        <span className="identity-logo">
+          <BracketsCurly weight="bold" />
+        </span>
+        <p className="eyebrow">WebAgent</p>
+        <h1>验证你的姓名</h1>
+        <p>请输入管理员为你创建的姓名，继续访问自己的 Sessions。</p>
+        <label htmlFor="identityName">姓名</label>
+        <input
+          id="identityName"
+          autoFocus
+          autoComplete="name"
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          placeholder="例如：张三"
+        />
+        {error && (
+          <div className="identity-error" role="alert">
+            {error}
+          </div>
+        )}
+        <button
+          className="primary-button"
+          type="submit"
+          disabled={busy || !name.trim()}
+        >
+          {busy ? "正在验证…" : "进入 WebAgent"}
+        </button>
+      </form>
+    </main>
+  );
+}
+
+function Root() {
+  const [user, setUser] = useState(() => {
+    const userId = localStorage.getItem(STORAGE.userId);
+    const name = localStorage.getItem(STORAGE.userName);
+    return userId && name ? { user_id: userId, name } : null;
+  });
+  const logout = () => {
+    localStorage.removeItem(STORAGE.userId);
+    localStorage.removeItem(STORAGE.userName);
+    localStorage.removeItem(STORAGE.active);
+    setUser(null);
+  };
+  useEffect(() => {
+    if (!user) return undefined;
+    let cancelled = false;
+    const validate = async () => {
+      try {
+        const current = await request("/v1/users/me", {
+          headers: { "X-WebAgent-User-ID": user.user_id },
+        }).then((response) => response.json());
+        if (!cancelled) {
+          localStorage.setItem(STORAGE.userName, current.name);
+          setUser(current);
+        }
+      } catch (failure) {
+        if (!cancelled && [401, 403, 404].includes(failure.status)) logout();
+      }
+    };
+    validate();
+    window.addEventListener("webagent:identity-invalid", logout);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("webagent:identity-invalid", logout);
+    };
+  }, [user?.user_id]);
+  return user ? (
+    <App user={user} onLogout={logout} />
+  ) : (
+    <IdentityGate onVerified={setUser} />
+  );
+}
+
+createRoot(document.getElementById("root")).render(<Root />);

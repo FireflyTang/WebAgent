@@ -7,12 +7,12 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.runtime.events import Diagnostic
 from app.sessions.runtime_debug import append_runtime_debug
 
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="log-test-key",
         sandbox_backend="local",
         runtime_backend="fake",
         database_url=f"sqlite:///{tmp_path / 'sessions.db'}",
@@ -95,7 +95,7 @@ def test_session_log_endpoint_groups_live_sdk_diagnostics_in_sequence(tmp_path: 
         second = client.get("/v1/sessions/grouped-log/log")
 
     assert first.status_code == 200
-    assert "诊断事件：4 条" in first.text
+    assert "用户 1 · Assistant 0 · 工具 1 · 错误 0" in first.text
     assert "高频 SDK 诊断批次：2 条" in first.text
     assert "ordinary interaction" in first.text
     assert "工具调用" in first.text
@@ -103,6 +103,32 @@ def test_session_log_endpoint_groups_live_sdk_diagnostics_in_sequence(tmp_path: 
     assert "pwd" in first.text
     assert "private thought" not in first.text
     assert second.status_code == 200
-    assert "诊断事件：5 条" in second.text
+    assert "用户 1 · Assistant 0 · 工具 1 · 错误 0" in second.text
     assert "最终结果" in second.text
     assert second.text.index("SDK 流事件") < second.text.index("工具调用")
+
+
+def test_session_service_keeps_diagnostic_error_and_result_fields_in_html_log(
+    tmp_path: Path,
+) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        service = client.app.state.session_service
+        asyncio.run(service.create_empty("diagnostic-fields"))
+        asyncio.run(
+            service._append_diagnostic_log(
+                "diagnostic-fields",
+                Diagnostic(
+                    "tool_result",
+                    tool_name="Bash",
+                    tool_result="ordinary result",
+                    is_error=True,
+                    result="runner supplied result",
+                ),
+            )
+        )
+        response = client.get("/v1/sessions/diagnostic-fields/log")
+
+    assert response.status_code == 200
+    assert "工具结果摘要" in response.text and "失败" in response.text
+    assert "runner supplied result" in response.text
+    assert "event-error" in response.text

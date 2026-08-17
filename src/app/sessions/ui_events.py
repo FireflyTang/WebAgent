@@ -51,6 +51,7 @@ class UiEventJournal:
     def __init__(self, repository: SessionRepository) -> None:
         self._repository = repository
         self._pending: deque[dict[str, object]] = deque()
+        self._pending_accepted_at: deque[datetime] = deque()
         self._wake = asyncio.Event()
         self._idle = asyncio.Event()
         self._idle.set()
@@ -59,6 +60,8 @@ class UiEventJournal:
         self._closed = False
         self._accepted: dict[UiEventKey, str] = {}
         self._fatal_conflicts: list[UiEventKey] = []
+        self._last_write_completed_at: datetime | None = None
+        self._last_write_error_at: datetime | None = None
 
     async def start(self) -> None:
         if self._writer is None:
@@ -83,6 +86,7 @@ class UiEventJournal:
             return key
         self._accepted[key] = canonical
         self._pending.append(copied)
+        self._pending_accepted_at.append(datetime.now(UTC))
         self._idle.clear()
         self._wake.set()
         return key
@@ -128,6 +132,26 @@ class UiEventJournal:
     def fatal_conflicts(self) -> tuple[UiEventKey, ...]:
         """测试/诊断钩子: 已隔离的永久 SQLite 冲突键。"""
         return tuple(self._fatal_conflicts)
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return bounded journal internals without exposing event payloads."""
+
+        writer = self._writer
+        return {
+            "writer_running": writer is not None and not writer.done(),
+            "pending_events": len(self._pending),
+            "fatal_conflicts": len(self._fatal_conflicts),
+            "closed": self._closed,
+            "oldest_pending_at": (
+                self._pending_accepted_at[0].isoformat() if self._pending_accepted_at else None
+            ),
+            "last_write_completed_at": (
+                self._last_write_completed_at.isoformat() if self._last_write_completed_at else None
+            ),
+            "last_write_error_at": (
+                self._last_write_error_at.isoformat() if self._last_write_error_at else None
+            ),
+        }
 
     async def wait_idle(self, *, timeout: float | None = None) -> bool:
         """测试/关闭钩子: 等待当前 pending 队列排空."""
@@ -222,11 +246,14 @@ class UiEventJournal:
                     key.sequence,
                 )
                 self._pending.popleft()
+                self._pending_accepted_at.popleft()
                 self._fatal_conflicts.append(key)
+                self._last_write_error_at = datetime.now(UTC)
                 self._changed.set()
                 retry_seconds = self._retry_initial_seconds
                 continue
             except Exception:
+                self._last_write_error_at = datetime.now(UTC)
                 # 绝不记录 event 内容: 它可含用户文本. 队头不出队, 后项不能越过它.
                 logger.warning(
                     "Could not persist browser UI event session_id=%s turn_id=%s sequence=%s",
@@ -238,6 +265,9 @@ class UiEventJournal:
                 retry_seconds = min(self._retry_max_seconds, retry_seconds * 2)
                 continue
             self._pending.popleft()
+            self._pending_accepted_at.popleft()
+            self._last_write_completed_at = datetime.now(UTC)
+            self._last_write_error_at = None
             # Once SQLite has accepted a canonical event, its unique key is
             # the durable idempotence/conflict authority.  Keeping every
             # successful payload here would grow forever; a later duplicate is
@@ -508,6 +538,26 @@ class ActiveTurnRegistry:
         if starting is not None:
             return {"task_state": "starting", "turn_id": starting, "last_sequence": 0}
         return {"task_state": "idle", "turn_id": None, "last_sequence": 0}
+
+    def diagnostics(self) -> list[dict[str, object]]:
+        """Describe current turns and subscribers without retaining event contents."""
+
+        session_ids = set(self._by_session) | set(self._starting)
+        diagnostics: list[dict[str, object]] = []
+        for session_id in sorted(session_ids):
+            snapshot = self.snapshot(session_id)
+            subscribers = len(self._subscribers.get(session_id, {}))
+            diagnostics.append(
+                {
+                    "session_id": session_id,
+                    "turn_id": snapshot["turn_id"],
+                    "state": snapshot["task_state"],
+                    "last_sequence": snapshot["last_sequence"],
+                    "subscribers": subscribers,
+                    "background": subscribers == 0,
+                }
+            )
+        return diagnostics
 
     async def wait_turn_released(self, turn_id: str, *, timeout: float | None = None) -> bool:
         """Test hook: wait until cleanup has released the turn and Session lock."""

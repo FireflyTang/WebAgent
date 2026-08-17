@@ -11,11 +11,11 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app.openai_compat.schemas import ChatCompletionRequest
 from app.runtime.base import ProviderConfig
 from app.runtime.events import Progress, TextDelta, validate_effort
 from app.runtime.model_catalog import ModelCatalog, ModelCatalogUnavailableError
 from app.sessions.active_turns import ActiveTurn
+from app.sessions.models import SessionTurnRequest
 from app.sessions.service import SessionService, SessionServiceError, SessionTurnCompleted
 from app.sessions.ui_events import (
     ActiveTurnBusyError,
@@ -67,6 +67,9 @@ async def web_config(request: Request) -> dict[str, object]:
             "delete_after_seconds": settings.session_delete_after_seconds,
             "runtime": settings.runtime_backend,
             "sandbox": settings.sandbox_backend,
+            "file_editor_max_bytes": settings.file_editor_max_bytes,
+            "file_upload_max_bytes": settings.file_upload_max_bytes,
+            "file_upload_max_files_per_session": settings.file_upload_max_files_per_session,
         },
     }
 
@@ -77,7 +80,6 @@ async def provider_models(payload: ProviderModelsRequest) -> dict[str, object]:
         api_key=payload.api_key,
         base_url=payload.base_url,
         auth_env=payload.auth_env,
-        fallback_models=(),
     )
     try:
         models = await catalog.discover()
@@ -276,6 +278,40 @@ def _text(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+async def _authorize_websocket_command(
+    websocket: WebSocket,
+    service: SessionService,
+    session_id: str,
+    user_id: str | None,
+    send_lock: asyncio.Lock,
+) -> bool:
+    """Re-check mutable user access immediately before a state-changing command."""
+
+    if user_id is None:
+        return True
+    user = await service.repository.get_user(user_id)
+    if user is None or not user.enabled:
+        await _error(
+            websocket,
+            "invalid_user",
+            "用户不存在或已停用",
+            recoverable=True,
+            send_lock=send_lock,
+        )
+        return False
+    record = await service.repository.get(session_id)
+    if record is None or record.owner_user_id != user.user_id:
+        await _error(
+            websocket,
+            "session_not_found",
+            "Session 不存在",
+            recoverable=True,
+            send_lock=send_lock,
+        )
+        return False
+    return True
+
+
 @router.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -301,6 +337,22 @@ async def websocket_chat(websocket: WebSocket) -> None:
             return
 
         service: SessionService = websocket.app.state.session_service
+        user_id = _text(hello.get("user_id"))
+        if "user_id" in hello and user_id is None:
+            await _error(websocket, "invalid_user", "user_id 无效")
+            await websocket.close(code=4403)
+            return
+        if user_id is not None:
+            user = await service.repository.get_user(user_id)
+            record = await service.repository.get(session_id)
+            if user is None or not user.enabled:
+                await _error(websocket, "invalid_user", "用户不存在或已停用")
+                await websocket.close(code=4403)
+                return
+            if record is None or record.owner_user_id != user.user_id:
+                await _error(websocket, "session_not_found", "Session 不存在")
+                await websocket.close(code=4404)
+                return
         journal = getattr(websocket.app.state, "ui_event_journal", None)
         if journal is None:
             # 独立 router 单元测试会直接挂载 Web API 而不走 create_app lifespan.
@@ -365,6 +417,10 @@ async def websocket_chat(websocket: WebSocket) -> None:
                 await _send_json(websocket, {"type": "pong"}, send_lock)
                 continue
             if payload.get("type") == "stop":
+                if not await _authorize_websocket_command(
+                    websocket, service, session_id, user_id, send_lock
+                ):
+                    continue
                 requested_turn = _text(payload.get("turn_id"))
                 if requested_turn is None:
                     await _error(
@@ -395,6 +451,10 @@ async def websocket_chat(websocket: WebSocket) -> None:
                     send_lock=send_lock,
                 )
                 continue
+            if not await _authorize_websocket_command(
+                websocket, service, session_id, user_id, send_lock
+            ):
+                continue
             content = _text(payload.get("content"))
             if content is None:
                 await _error(
@@ -405,7 +465,6 @@ async def websocket_chat(websocket: WebSocket) -> None:
                     send_lock=send_lock,
                 )
                 continue
-            messages: list[dict[str, str]] = []
             provider_payload = payload.get("provider")
             try:
                 provider = ProviderModelsRequest.model_validate(provider_payload)
@@ -447,7 +506,6 @@ async def websocket_chat(websocket: WebSocket) -> None:
                     api_key=provider.api_key,
                     base_url=provider.base_url,
                     auth_env=provider.auth_env,
-                    fallback_models=(),
                 )
                 provider_identity = identity
             try:
@@ -471,14 +529,11 @@ async def websocket_chat(websocket: WebSocket) -> None:
                 )
                 continue
             system_prompt = _text(payload.get("system_prompt"))
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": content})
             try:
-                request = ChatCompletionRequest(
+                request = SessionTurnRequest(
+                    message=content,
                     model=model,
-                    messages=messages,
-                    stream=True,
+                    system_prompt=system_prompt,
                 )
                 provider_config = ProviderConfig(
                     base_url=provider.base_url,

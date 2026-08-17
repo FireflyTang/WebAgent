@@ -65,6 +65,35 @@ async def test_journal_retries_fifo_and_snapshot_is_complete_before_db_recovers(
 
 
 @pytest.mark.asyncio
+async def test_journal_diagnostics_track_oldest_failure_and_success_without_payload() -> None:
+    repository = _RecordingRepository(failures=100)
+    journal = UiEventJournal(repository)  # type: ignore[arg-type]
+    await journal.start()
+    journal.accept(_event(1, content="must not appear in diagnostics"))
+    await repository.started.wait()
+    for _ in range(20):
+        failed = journal.diagnostics()
+        if failed["last_write_error_at"] is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    assert failed["pending_events"] == 1
+    assert failed["oldest_pending_at"] is not None
+    assert failed["last_write_completed_at"] is None
+    assert failed["last_write_error_at"] is not None
+    assert "must not appear" not in repr(failed)
+
+    repository.failures = 0
+    assert await journal.wait_idle(timeout=1)
+    recovered = journal.diagnostics()
+    assert recovered["pending_events"] == 0
+    assert recovered["oldest_pending_at"] is None
+    assert recovered["last_write_completed_at"] is not None
+    assert recovered["last_write_error_at"] is None
+    await journal.close()
+
+
+@pytest.mark.asyncio
 async def test_journal_writer_survives_empty_wait_and_never_blocks_accept_behind_slow_head() -> (
     None
 ):
@@ -80,6 +109,14 @@ async def test_journal_writer_survives_empty_wait_and_never_blocks_accept_behind
     await repository.started.wait()
     journal.accept(_event(2))
     assert [event["sequence"] for event in journal.snapshot("session")] == [1, 2]
+    diagnostics = journal.diagnostics()
+    assert diagnostics["writer_running"] is True
+    assert diagnostics["pending_events"] == 2
+    assert diagnostics["fatal_conflicts"] == 0
+    assert diagnostics["closed"] is False
+    assert diagnostics["oldest_pending_at"] is not None
+    assert diagnostics["last_write_completed_at"] is None
+    assert diagnostics["last_write_error_at"] is None
     assert not writer.done()
 
     gate.set()
@@ -141,6 +178,16 @@ async def test_registry_subscription_detach_does_not_cancel_and_new_subscriber_c
     registry.unsubscribe(first)
     await asyncio.sleep(0)
     assert registry.snapshot("background")["task_state"] == "running"
+    assert registry.diagnostics() == [
+        {
+            "session_id": "background",
+            "turn_id": "turn",
+            "state": "running",
+            "last_sequence": 1,
+            "subscribers": 0,
+            "background": True,
+        }
+    ]
     assert not producer_cancelled.is_set()
 
     second = registry.subscribe("background")

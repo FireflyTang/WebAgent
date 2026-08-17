@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from .models import SessionState, utc_now
 from .service import SessionBusyError, SessionService, SessionServiceError
@@ -26,9 +26,14 @@ class LifecycleReaper:
         self.delete_after = timedelta(seconds=delete_after_seconds)
         self.interval = interval_seconds
         self._stopping = asyncio.Event()
+        self.last_tick_at: datetime | None = None
+        self.last_tick_completed_at: datetime | None = None
+        self.last_error_at: datetime | None = None
+        self.run_started_at: datetime | None = None
 
     async def tick(self) -> None:
         now = utc_now()
+        self.last_tick_at = now
         list_sessions = getattr(self.service.repository, "list_sessions", None)
         all_sessions = await list_sessions() if list_sessions is not None else []
 
@@ -111,8 +116,11 @@ class LifecycleReaper:
                 logger.exception(
                     "Failed to delete idle session %s; continuing reaper tick", record.session_id
                 )
+        self.last_tick_completed_at = utc_now()
+        self.last_error_at = None
 
     async def run(self) -> None:
+        self.run_started_at = utc_now()
         while not self._stopping.is_set():
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=self.interval)
@@ -120,7 +128,20 @@ class LifecycleReaper:
                 try:
                     await self.tick()
                 except Exception:
+                    self.last_error_at = utc_now()
                     logger.exception("Lifecycle reaper tick failed; it will retry")
 
     def stop(self) -> None:
         self._stopping.set()
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+            "last_tick_completed_at": (
+                self.last_tick_completed_at.isoformat() if self.last_tick_completed_at else None
+            ),
+            "last_error_at": self.last_error_at.isoformat() if self.last_error_at else None,
+            "run_started_at": self.run_started_at.isoformat() if self.run_started_at else None,
+            "stopping": self._stopping.is_set(),
+            "interval_seconds": self.interval,
+        }

@@ -1,0 +1,26 @@
+name: Repository request
+description: Record a question, discussion, bug, or implementation request
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Creating an ordinary issue does not invoke Codex. To invoke it immediately,
+        include the exact lowercase mention `@codex` in the title or a textarea.
+        You can also create the issue first and mention `@codex` in a later comment.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What are you observing, discussing, or trying to change?
+      placeholder: Include relevant behavior, files, logs, screenshots, or constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: request
+    attributes:
+      label: Request or question
+      description: State the expected result. Add @codex here only if it should start now.
+      placeholder: Ask a question, propose a change, or describe acceptance criteria.
+    validations:
+      required: true

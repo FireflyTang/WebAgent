@@ -14,7 +14,6 @@ from app.sessions.models import SessionRecord, utc_now
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="directory-key",
         runtime_backend="fake",
         sandbox_backend="local",
         database_url=f"sqlite:///{tmp_path / 'directory.db'}",
@@ -31,11 +30,7 @@ def _headers() -> dict[str, str]:
     return {}
 
 
-def _openai_headers(session_id: str) -> dict[str, str]:
-    return {"Authorization": "Bearer directory-key", "X-Session-ID": session_id}
-
-
-def test_session_directory_create_patch_and_transcript_contract(tmp_path: Path) -> None:
+def test_session_directory_create_and_patch_contract(tmp_path: Path) -> None:
     with TestClient(create_app(_settings(tmp_path))) as client:
         first = client.post(
             "/v1/sessions",
@@ -64,21 +59,21 @@ def test_session_directory_create_patch_and_transcript_contract(tmp_path: Path) 
         asyncio.run(
             client.app.state.repository.create(
                 SessionRecord(
-                    session_id="legacy-zhipu",
+                    session_id="legacy-runtime",
                     sandbox_id="local-legacy",
-                    claude_session_id="zhipu-legacy",
-                    metadata={"runtime_backend": "ZhipuRuntime"},
+                    claude_session_id="legacy-runtime",
+                    metadata={"runtime_backend": "LegacyRuntime"},
                 )
             )
         )
         listed_legacy = client.get("/v1/sessions", headers=_headers()).json()
         legacy = next(
-            item for item in listed_legacy["sessions"] if item["session_id"] == "legacy-zhipu"
+            item for item in listed_legacy["sessions"] if item["session_id"] == "legacy-runtime"
         )
         assert legacy["compatible"] is False
         assert legacy["compatibility_reason"] == "运行时后端不兼容"
         assert (
-            client.get("/v1/sessions/legacy-zhipu", headers=_headers()).json()["compatible"]
+            client.get("/v1/sessions/legacy-runtime", headers=_headers()).json()["compatible"]
             is False
         )
 
@@ -109,34 +104,6 @@ def test_session_directory_create_patch_and_transcript_contract(tmp_path: Path) 
         )
         assert invalid_effort.status_code == 400
         assert "effort" in invalid_effort.json()["error"]["message"]
-
-        chat = client.post(
-            "/v1/chat/completions",
-            headers=_openai_headers(first_id),
-            json={
-                "model": "claude-code-agent",
-                "messages": [{"role": "user", "content": "create a calculator"}],
-            },
-        )
-        assert chat.status_code == 200
-        transcript = client.get(f"/v1/sessions/{first_id}/transcript", headers=_headers())
-
-    assert transcript.status_code == 200
-    assert next((item["role"], item["content"]) for item in transcript.json()["messages"]) == (
-        "user",
-        "create a calculator",
-    )
-    assert transcript.json()["messages"][1]["role"] == "assistant"
-
-
-def test_session_rest_no_longer_requires_demo_bearer_key(tmp_path: Path) -> None:
-    with TestClient(create_app(_settings(tmp_path))) as client:
-        created = client.post("/v1/sessions", json={"title": "No bearer"})
-        listed = client.get("/v1/sessions")
-
-    assert created.status_code == 201
-    assert listed.status_code == 200
-    assert listed.json()["sessions"][0]["title"] == "No bearer"
 
 
 def test_session_history_has_no_transcript_fallback_before_web_events(tmp_path: Path) -> None:

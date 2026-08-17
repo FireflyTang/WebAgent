@@ -18,11 +18,11 @@ Sequence 必须在实际 dispatch 边界生成，而不是 producer 提前编号
 
 ## Fake runtime 是可靠演示基础设施
 
-确定性 Fake 能在没有网络和模型额度时覆盖 Session、SSE、WebSocket、workspace、生命周期与错误合同。它适合 smoke 和精确 UI 测试，但不能替代真实 SDK、Docker、Provider 或浏览器验收。
+确定性 Fake 能在没有网络和模型额度时覆盖 Session、WebSocket、workspace、生命周期与错误合同。它适合精确 UI 测试，但不能替代真实 SDK、Docker、Provider 或浏览器验收。
 
 ## Provider 配置与应用鉴权是两件事
 
-Provider Key 授权上游模型调用；WebAgent 的 API Key 只保护 OpenAI-compatible 路径。混用字段会让用户不知道 Secret 交给谁，也妨碍不同浏览器按 turn 使用不同 Provider。
+Provider Key 授权上游模型调用。它不应与 WebAgent 的身份或授权概念混用，也不应妨碍不同浏览器按 turn 使用不同 Provider。
 
 连接设置应严格执行“测试目录 → 选默认 model/effort → 保存”，字段变化立即使验证失效。目录失败不应静默回退到服务端模型，否则设置看似成功、执行却去了另一个 Provider。
 
@@ -48,6 +48,6 @@ SDK 对象应在 worker adapter 边界转为项目自有 NDJSON。stdout 保持�
 
 ## 发布验证应覆盖真正运行路径
 
-Health 200 和静态资源 200 不能证明 Python 进程、worker 镜像和前端协议来自同一版本。发布门禁需要全套 Python、前端协议/构建、真实 Chromium、Docker integration、curl smoke、依赖审计和 diff 检查。
+Health 200 和静态资源 200 不能证明 Python 进程、worker 镜像和前端协议来自同一版本。发布门禁需要全套 Python、前端协议/构建、真实 Chromium、Docker integration、依赖审计和 diff 检查。
 
 默认监听与访问地址要分别说明；本地发布应优先 `127.0.0.1`。Docker build、容器 runtime 和 system service 也不会自动继承交互 shell 的代理环境，网络问题应逐层验证。

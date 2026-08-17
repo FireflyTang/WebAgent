@@ -305,6 +305,8 @@ def test_runner_deduplicates_partial_and_final_text_and_emits_result_metadata(ca
         if event["type"] == "diagnostic" and event["message_type"] == "result"
     )
     assert "visible_text" not in result
+    assert result["is_error"] is False
+    assert result["result"] == "hellohello world"
     assert events[-1] == {"type": "completed", "stop_reason": "stop"}
 
 
@@ -424,7 +426,44 @@ def test_runner_maps_server_tool_blocks_to_progress_and_diagnostic(capsys, monke
     use = next(event for event in diagnostics if event["message_type"] == "tool_use")
     result = next(event for event in diagnostics if event["message_type"] == "tool_result")
     assert use["tool_input"] == {"query": "sdk"}
+    assert result["is_error"] is False
     assert result["tool_result"] == {"result": "ok"}
+
+
+def test_runner_preserves_real_tool_result_block_shape_and_error_status(capsys) -> None:
+    mapper = EventMapper()
+    mapper.assistant(
+        AssistantMessage(
+            content=[ToolUseBlock(id="bash-1", name="Bash", input={"command": "echo ok"})],
+            model="glm",
+        )
+    )
+    mapper.user(
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="bash-1",
+                    content=[{"type": "text", "text": "real SDK result"}],
+                    is_error=True,
+                )
+            ]
+        )
+    )
+
+    result = next(
+        event
+        for event in _events(capsys)
+        if event["type"] == "diagnostic" and event["message_type"] == "tool_result"
+    )
+    assert result == {
+        "type": "diagnostic",
+        "message_type": "tool_result",
+        "tool_name": "Bash",
+        "tool_use_id": "bash-1",
+        "parent_tool_use_id": None,
+        "is_error": True,
+        "tool_result": [{"type": "text", "text": "real SDK result"}],
+    }
 
 
 def test_runner_result_closes_open_tool_and_task_with_their_associations(capsys) -> None:

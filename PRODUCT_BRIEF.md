@@ -4,7 +4,7 @@
 
 ## 产品定位
 
-WebAgent 是“通过对话驱动持久代码沙箱”的单人工作台。每个 Session 绑定 Transcript、Agent 上下文、模型/effort 选择、诊断历史和独立工作区。用户可以从空目录开始，也可以上传小型项目，再让 Agent 修改文件、运行命令和测试。
+WebAgent 是“通过对话驱动持久代码沙箱”的轻量共享工作台。每个 Session 绑定用户、Transcript、Agent 上下文、模型/effort 选择、诊断历史和独立工作区。用户可以从空目录开始，也可以上传小型项目，再让 Agent 修改文件、运行命令和测试。
 
 它不是普通聊天页，也不是完整在线 IDE。当前重点是让第一次接触 Coding Agent 的用户，能够看懂“任务正在做什么”、拿到文件结果，并在多个独立任务之间自然切换。
 
@@ -12,21 +12,23 @@ WebAgent 是“通过对话驱动持久代码沙箱”的单人工作台。每�
 
 当前 WebAgent 提供：
 
+- 管理员在 `/admin` 预建、启停用户；用户输入预建姓名进入并可登出。姓名验证只做分流，不是安全认证。
+- Session 从创建起绑定用户，工作台按当前用户加载；后台可以查看所有用户、Session、运行任务概览和可管理配置。
 - 桌面三栏工作台，以及窄屏 Session 操作轨和文件抽屉；输入框在低高度视口中仍可见。
 - 真实 Session 列表、日期分组、自动标题、Transcript、生命周期与持久工作区。自动标题仍由前端截取首条用户消息的前 36 个字符，不是模型总结。
 - Provider 设置流程：`测试连接 → 选择默认模型/effort → 保存设置`。动态目录只展示 Provider 返回的模型 ID，不补写描述或推荐。
 - 应用持有的后台 turn。不同 Session 可并行；关闭页面不取消任务，重连会回放历史并继续实时订阅；同一 Session 同时只运行一个任务。
 - 真实 Stop、结构化步骤与活动、任务/步骤耗时、终态和 usage 展示，不暴露模型思维链。
-- 上传文件/目录、树形浏览和双击下载；没有内置预览、编辑器或 Diff。
-- SQLite Transcript、UI event history 和详细诊断日志，以及 OpenAI-compatible curl/SSE 入口。
-- FakeRuntime 无 Provider 演示，和 Docker worker 内的真实 Agent SDK 路径。
+- 上传文件/目录、树形浏览、二进制下载，以及带常见语言高亮的 UTF-8 文本查看/编辑；Agent 运行时只读，保存使用 revision 冲突提示。当前没有 Diff。
+- SQLite Transcript、UI event history 和详细诊断日志。
+- FakeRuntime 的确定性演示，和 Docker worker 内的真实 Agent SDK 路径。
 
 ## 核心用户流程
 
 ### 第一次使用 Web UI
 
 1. 维护者先设置 `RUNTIME_BACKEND=claude`、`SANDBOX_BACKEND=docker` 和可访问 Provider 的 `DOCKER_NETWORK_MODE`，然后重启服务。默认 Fake runtime 即使收到浏览器 Provider 配置也仍是 Fake。
-2. 用户在本机打开 WebAgent。
+2. 管理员打开 `/admin` 创建用户，用户再打开 WebAgent 并输入自己的预建姓名。
 3. 在连接设置填写 Anthropic-compatible Endpoint、Provider API Key 和认证方式。
 4. 点击“测试连接”，确认动态模型目录。
 5. 选择默认模型与 effort，保存设置。
@@ -52,13 +54,15 @@ WebAgent 是“通过对话驱动持久代码沙箱”的单人工作台。每�
 | UI events | 带 session/turn/sequence/time 的进度与终态历史，用于重建任务界面 |
 | 诊断日志 | 面向排障的详细事件，可能包含完整命令与输出，必须按敏感数据管理 |
 | Provider 配置 | 浏览器侧 Endpoint、Key 和认证方式；是 turn 上下文，不是 WebAgent 登录凭据 |
+| 用户 | 后台预建的姓名与稳定 ID；用于 Session 归属和浏览器配置分流，不是认证主体 |
+| 后台设置 | SQLite 中保存的下一次启动配置；页面同时展示当前运行值和待生效值 |
 
 ## 当前边界
 
-- 面向一个可信本地用户；Web、Session、文件和日志接口没有账号鉴权或租户隔离。
+- 面向可信本地小范围用户；姓名匹配和 Session owner 不提供账号鉴权，后台也没有权限保护。
 - Docker 是 Demo 级防误操作边界，不是为敌对代码设计的强沙箱。
 - 同一 Session 没有队列；服务重启后不能继续运行中的任务。
-- 文件能力不含 Git 导入、预览、编辑、Diff、回退、快照和大文件分块。
+- 文件能力不含 Git 导入、Diff、回退、快照和大文件分块；超出后台阈值的文件只提示下载。
 - 日志一次性渲染完整 Session 诊断，没有筛选、分页和保留策略。
 - 模型可用性与 effort 支持由 Provider 决定；产品只可信地展示模型 ID。
 

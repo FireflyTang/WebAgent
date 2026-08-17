@@ -13,7 +13,6 @@ from app.main import create_app
 
 def settings_for(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="web-test-key",
         sandbox_backend="local",
         runtime_backend="fake",
         database_url=f"sqlite:///{tmp_path / 'web.db'}",
@@ -30,7 +29,7 @@ def _message(content: str) -> dict[str, object]:
     return {
         "type": "message",
         "content": content,
-        "model": "claude-code-agent",
+        "model": "test-model",
         "provider": {
             "base_url": "https://provider.example",
             "api_key": "test-key",
@@ -46,7 +45,7 @@ def _provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
             del kwargs
 
         async def discover(self) -> tuple[str, ...]:
-            return ("claude-code-agent",)
+            return ("test-model",)
 
         async def aclose(self) -> None:
             return None
@@ -127,6 +126,72 @@ def test_upload_rejects_symbolic_link_escape(tmp_path: Path) -> None:
     assert not (outside / "pwn.txt").exists()
 
 
+def test_file_response_is_bound_to_opened_inode_during_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TestClient(create_app(settings_for(tmp_path))) as client:
+        uploaded = client.post(
+            "/v1/sessions/web-inode/files",
+            files=[("files", ("answer.txt", b"validated inode", "text/plain"))],
+        )
+        assert uploaded.status_code == 200
+        session = client.get("/v1/sessions/web-inode").json()
+        workspace = tmp_path / "workspaces" / session["sandbox_id"]
+        target = workspace / "answer.txt"
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"host secret")
+        service = client.app.state.session_service
+        original_open_file = service.open_file
+
+        async def replace_after_open(session_id: str, file_path: str):
+            opened = await original_open_file(session_id, file_path)
+            target.unlink()
+            target.symlink_to(outside)
+            return opened
+
+        monkeypatch.setattr(service, "open_file", replace_after_open)
+        response = client.get("/v1/sessions/web-inode/files/content/answer.txt")
+
+        assert response.status_code == 200
+        assert response.content == b"validated inode"
+        assert "content-length" not in response.headers
+        assert response.content != outside.read_bytes()
+
+
+def test_file_content_races_and_non_visible_paths_have_stable_errors(tmp_path: Path) -> None:
+    with TestClient(create_app(settings_for(tmp_path))) as client:
+        uploaded = client.post(
+            "/v1/sessions/web-paths/files",
+            files=[("files", ("visible.txt", b"visible", "text/plain"))],
+        )
+        assert uploaded.status_code == 200
+        session = client.get("/v1/sessions/web-paths").json()
+        workspace = tmp_path / "workspaces" / session["sandbox_id"]
+        (workspace / "visible.txt").unlink()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret", encoding="utf-8")
+        (workspace / "escape").symlink_to(outside, target_is_directory=True)
+        (workspace / ".hidden.txt").write_text("hidden", encoding="utf-8")
+        cache = workspace / "__pycache__"
+        cache.mkdir()
+        (cache / "cached.pyc").write_bytes(b"cached")
+
+        listed = client.get("/v1/sessions/web-paths/files")
+        missing = client.get("/v1/sessions/web-paths/files/content/visible.txt")
+        symlink = client.get("/v1/sessions/web-paths/files/content/escape/secret.txt")
+        hidden = client.get("/v1/sessions/web-paths/files/content/.hidden.txt")
+
+    assert listed.status_code == 200
+    assert listed.json()["files"] == []
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "session_not_found"
+    assert symlink.status_code == 400
+    assert symlink.json()["error"]["code"] == "invalid_workspace_path"
+    assert hidden.status_code == 400
+    assert hidden.json()["error"]["code"] == "invalid_workspace_path"
+
+
 def test_websocket_chat_streams_and_reuses_session(tmp_path: Path) -> None:
     with TestClient(create_app(settings_for(tmp_path))) as client:
         with client.websocket_connect("/ws/chat") as websocket:
@@ -156,3 +221,75 @@ def test_websocket_chat_streams_and_reuses_session(tmp_path: Path) -> None:
                 if event["type"] == "done":
                     break
             assert "第 2 轮" in second
+
+
+def test_websocket_session_replays_and_keeps_workspace_after_app_restart(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    session_id = "web-restart"
+
+    with TestClient(create_app(settings)) as first_client:
+        with first_client.websocket_connect("/ws/chat") as websocket:
+            websocket.send_json({"type": "hello", "session_id": session_id})
+            assert websocket.receive_json() == {"type": "sync_begin", "session_id": session_id}
+            assert websocket.receive_json()["type"] == "ready"
+
+            websocket.send_json(_message("创建计算器，实现加法"))
+            first_output = ""
+            while True:
+                event = websocket.receive_json()
+                if event["type"] == "delta":
+                    first_output += event["content"]
+                if event["type"] == "done":
+                    break
+
+        first_session = first_client.get(f"/v1/sessions/{session_id}").json()
+
+    assert "第 1 轮" in first_output
+    assert "测试通过" in first_output
+    workspace = tmp_path / "workspaces" / first_session["sandbox_id"]
+    assert (workspace / "calculator.py").exists()
+
+    with TestClient(create_app(settings)) as second_client:
+        with second_client.websocket_connect("/ws/chat") as websocket:
+            websocket.send_json({"type": "hello", "session_id": session_id})
+            assert websocket.receive_json() == {"type": "sync_begin", "session_id": session_id}
+            replayed = []
+            while True:
+                event = websocket.receive_json()
+                if event["type"] == "ready":
+                    assert event["session_id"] == session_id
+                    assert event["task_state"] == "idle"
+                    break
+                replayed.append(event)
+            assert any(event["type"] == "done" for event in replayed)
+
+            websocket.send_json(_message("增加减法"))
+            second_output = ""
+            while True:
+                event = websocket.receive_json()
+                if event["type"] == "delta":
+                    second_output += event["content"]
+                if event["type"] == "done":
+                    break
+
+        second_session = second_client.get(f"/v1/sessions/{session_id}").json()
+        transcript = second_client.get(f"/v1/sessions/{session_id}/transcript").json()
+
+    assert "第 2 轮" in second_output
+    assert "test_subtract" in second_output
+    assert second_session["sandbox_id"] == first_session["sandbox_id"]
+    assert second_session["runtime_session_id"] == first_session["runtime_session_id"]
+    assert [message["role"] for message in transcript["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [message["content"] for message in transcript["messages"]][::2] == [
+        "创建计算器，实现加法",
+        "增加减法",
+    ]
+    calculator = workspace / "calculator.py"
+    assert calculator.exists()
+    assert "def add" in calculator.read_text()
+    assert "def subtract" in calculator.read_text()

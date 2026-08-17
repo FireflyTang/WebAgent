@@ -1,0 +1,3 @@
+# Used only when this repository is public.
+# The repository owner is always authorized and does not need to be listed.
+# Add one additional trusted GitHub username per line, without an @ prefix.

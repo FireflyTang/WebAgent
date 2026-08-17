@@ -82,7 +82,7 @@ def _provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
             del kwargs
 
         async def discover(self) -> tuple[str, ...]:
-            return ("claude-code-agent",)
+            return ("test-model",)
 
         async def aclose(self) -> None:
             return None
@@ -94,7 +94,7 @@ def _message(content: str) -> dict[str, object]:
     return {
         "type": "message",
         "content": content,
-        "model": "claude-code-agent",
+        "model": "test-model",
         "provider": {
             "base_url": "https://provider.example",
             "api_key": "test-key",
@@ -105,7 +105,6 @@ def _message(content: str) -> dict[str, object]:
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
-        api_key="turn-key",
         runtime_backend="fake",
         sandbox_backend="local",
         database_url=f"sqlite:///{tmp_path / 'turns.db'}",
@@ -211,6 +210,42 @@ def test_stop_cancels_stream_emits_ordered_terminal_event_and_allows_next_turn(
     assert persisted == [*opening, stopped, *completed_events]
     assert persisted[-1]["type"] == "done" and persisted[-1]["completed"] is True
     assert "test-key" not in str(persisted)
+
+
+def test_running_turn_allows_file_reads_but_keeps_upload_busy(tmp_path: Path) -> None:
+    runtime = BlockingRuntime()
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        client.app.state.session_service.runtime = runtime
+        uploaded = client.post(
+            "/v1/sessions/running-files/files",
+            files=[("files", ("result.txt", b"partial result", "text/plain"))],
+        )
+        assert uploaded.status_code == 200
+        with client.websocket_connect("/ws/chat") as websocket:
+            websocket.send_json({"type": "hello", "session_id": "running-files"})
+            _receive_ready(websocket)
+            websocket.send_json(_message("block"))
+            events = _receive_until_matching(
+                websocket,
+                lambda event: event["type"] == "progress" and event.get("tool_name") == "Bash",
+            )
+            turn_id = events[0]["turn_id"]
+
+            listed = client.get("/v1/sessions/running-files/files")
+            assert listed.status_code == 200
+            assert listed.json()["files"] == [{"path": "result.txt", "size": 14}]
+            content = client.get("/v1/sessions/running-files/files/content/result.txt")
+            assert content.status_code == 200
+            assert content.content == b"partial result"
+            busy = client.post(
+                "/v1/sessions/running-files/files",
+                files=[("files", ("new.txt", b"write", "text/plain"))],
+            )
+            assert busy.status_code == 409
+            assert busy.json()["error"]["code"] == "session_busy"
+
+            websocket.send_json({"type": "stop", "turn_id": turn_id})
+            assert _receive_until(websocket, "done")[-1]["stop_reason"] == "stopped"
 
 
 def test_disconnect_detaches_and_reconnected_socket_can_stop_background_turn(

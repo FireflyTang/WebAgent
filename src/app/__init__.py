@@ -1,1 +1,1 @@
-"""OpenAI-compatible coding-agent demo."""
+"""WebAgent browser coding workspace."""

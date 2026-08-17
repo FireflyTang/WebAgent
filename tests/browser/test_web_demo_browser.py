@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Browser, Page, sync_playwright
+from playwright.sync_api import Browser, Page, expect, sync_playwright
 
 
 def _non_loopback_address() -> str:
@@ -48,18 +48,25 @@ def _wait_for_server(host: str, port: int) -> None:
 
 
 @pytest.fixture
-def web_server(tmp_path: Path):
+def web_server(tmp_path: Path, request: pytest.FixtureRequest):
     host, port, provider_port = _non_loopback_address(), _free_port(), _free_port()
+    provider_control = {"fail": False, "requests": 0, "lock": threading.Lock()}
 
     class ProviderHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             if self.path != "/v1/models":
                 self.send_error(404)
                 return
+            with provider_control["lock"]:
+                provider_control["requests"] += 1
+                fail = provider_control["fail"]
+            if fail:
+                self.send_error(503, "Controlled Provider heartbeat failure")
+                return
             payload = json.dumps(
                 {
                     "data": [
-                        {"id": "claude-code-agent"},
+                        {"id": "test-model"},
                         {"id": "browser-fake-model"},
                         {"id": "keyboard-model"},
                     ]
@@ -83,16 +90,17 @@ def web_server(tmp_path: Path):
             "PYTHONPATH": str(Path.cwd() / "src"),
             "HOST": "0.0.0.0",
             "PORT": str(port),
-            "API_KEY": "browser-demo-key",
             "RUNTIME_BACKEND": "fake",
             "SANDBOX_BACKEND": "local",
             "DATABASE_URL": f"sqlite:///{tmp_path / 'browser.db'}",
             "WORKSPACE_ROOT": str(tmp_path / "workspaces"),
             "FAKE_STREAM_DELAY_MS": "0",
             "FAKE_LONG_TASK_DELAY_MS": "0",
-            "CLAUDE_AVAILABLE_MODELS": "claude-code-agent,browser-fake-model,keyboard-model",
         }
     )
+    editor_limit = getattr(request, "param", 128)
+    if editor_limit is not None:
+        environment["FILE_EDITOR_MAX_BYTES"] = str(editor_limit)
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", str(port)],
         cwd=Path.cwd(),
@@ -102,7 +110,11 @@ def web_server(tmp_path: Path):
     )
     try:
         _wait_for_server(host, port)
-        yield {"web": f"http://{host}:{port}", "provider": f"http://127.0.0.1:{provider_port}"}
+        yield {
+            "web": f"http://{host}:{port}",
+            "provider": f"http://127.0.0.1:{provider_port}",
+            "provider_control": provider_control,
+        }
     finally:
         process.terminate()
         try:
@@ -152,8 +164,18 @@ def _click_visible_new_session(page: Page) -> None:
     mobile_button.click()
 
 
-def _connect_and_create(page: Page, web_server: dict[str, str]) -> None:
+def _login(page: Page, web_server: dict[str, str], name: str = "Browser User") -> str:
+    created = page.request.post(f"{web_server['web']}/v1/admin/users", data={"name": name})
+    assert created.status in {201, 409}
     page.goto(web_server["web"], wait_until="domcontentloaded", timeout=10_000)
+    page.locator("#identityName").fill(name)
+    page.get_by_role("button", name="进入 WebAgent").click()
+    page.locator(".app-shell").wait_for(state="visible", timeout=10_000)
+    return page.evaluate("localStorage.getItem('webagent.user-id')")
+
+
+def _connect_and_create(page: Page, web_server: dict[str, str]) -> None:
+    _login(page, web_server)
     page.locator("#providerEndpoint").fill(web_server["provider"])
     page.locator("#providerApiKey").fill("provider-test-key")
     page.locator("#testProvider").click()
@@ -161,7 +183,819 @@ def _connect_and_create(page: Page, web_server: dict[str, str]) -> None:
     page.locator("#saveProvider").click()
     page.locator(".connection-popover").wait_for(state="hidden", timeout=10_000)
     _click_visible_new_session(page)
+    page.wait_for_function(
+        """
+        () => {
+          const activeId = localStorage.getItem('oca.active-session');
+          return activeId && document.querySelector('.session-row.selected')?.dataset.sessionId === activeId;
+        }
+        """,
+        timeout=10_000,
+    )
+
+
+def _upload_browser_file(page: Page, tmp_path: Path, name: str, content: bytes) -> None:
+    source = tmp_path / name
+    source.write_bytes(content)
+    page.locator("#fileInput").set_input_files(source)
+    page.get_by_role("treeitem", name=name).wait_for(timeout=10_000)
+
+
+def _mutate_editor_file(page: Page, path: str, content: str) -> dict[str, object]:
+    return page.evaluate(
+        """
+        async ({path, content}) => {
+          const sessionId = localStorage.getItem("oca.active-session");
+          const encoded = path.split("/").map(encodeURIComponent).join("/");
+          const headers = {"X-WebAgent-User-ID": localStorage.getItem("webagent.user-id")};
+          const opened = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/files/editor/${encoded}`, {headers});
+          const metadata = await opened.json();
+          const saved = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/files/editor/${encoded}`, {
+            method: "PUT",
+            headers: {...headers, "Content-Type": "application/json"},
+            body: JSON.stringify({content, expected_revision: metadata.revision}),
+          });
+          return {status: saved.status, payload: await saved.json()};
+        }
+        """,
+        {"path": path, "content": content},
+    )
+
+
+def test_configured_provider_without_session_is_connected_without_websocket(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        window.__socketCount = 0;
+        const NativeSocket = window.WebSocket;
+        function ObservedSocket(...args) {
+          window.__socketCount += 1;
+          return new NativeSocket(...args);
+        }
+        for (const key of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"])
+          ObservedSocket[key] = NativeSocket[key];
+        window.WebSocket = ObservedSocket;
+        """
+    )
+    _login(page, web_server)
+    page.locator("#providerEndpoint").fill(web_server["provider"])
+    page.locator("#providerApiKey").fill("provider-test-key")
+    page.locator("#testProvider").click()
+    page.locator(".provider-tested").wait_for(state="visible", timeout=10_000)
+    page.locator("#saveProvider").click()
+    page.locator(".connection-popover").wait_for(state="hidden", timeout=10_000)
+    page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=5_000)
+    badge = page.locator("#connectionBadge")
+    assert "configured" in (badge.get_attribute("class") or "")
+    assert (
+        badge.locator("i").evaluate("node => getComputedStyle(node).backgroundColor")
+        == "rgb(86, 174, 105)"
+    )
+    assert page.evaluate("window.__socketCount") == 0
+
+
+def test_provider_heartbeat_recovers_without_opening_settings(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        const nativeSetTimeout = window.setTimeout;
+        window.setTimeout = (callback, delay, ...args) =>
+          nativeSetTimeout(callback, delay === 15000 ? 100 : delay, ...args);
+        """
+    )
+    _login(page, web_server)
+    page.locator("#providerEndpoint").fill(web_server["provider"])
+    page.locator("#providerApiKey").fill("provider-test-key")
+    page.locator("#testProvider").click()
+    page.locator(".provider-tested").wait_for(state="visible", timeout=10_000)
+    page.locator("#saveProvider").click()
+    page.locator(".connection-popover").wait_for(state="hidden", timeout=10_000)
+    page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=5_000)
+
+    control = web_server["provider_control"]
+    with control["lock"]:
+        initial_requests = control["requests"]
+        control["fail"] = True
+    page.locator("#connectionBadge b").get_by_text("连接中断", exact=True).wait_for(timeout=5_000)
+    assert page.locator(".connection-popover").is_hidden()
+    with control["lock"]:
+        assert control["requests"] > initial_requests
+        control["fail"] = False
+    page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=5_000)
+
+
+def test_file_editor_highlights_saves_reloads_conflicts_and_keeps_safe_downloads(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    _connect_and_create(page, web_server)
+    _upload_browser_file(page, tmp_path, "example.py", b"def answer():\n    return 1\n")
+    row = page.get_by_role("treeitem", name="example.py")
+    row.dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    assert (
+        page.locator("#fileEditorDialog .token.keyword").get_by_text("def", exact=True).is_visible()
+    )
+    editor = page.locator("#fileEditorInput")
+    editor.fill("def answer():\n    return 2\n")
+    page.locator("#editorSave").click()
+    page.get_by_text("文件已保存", exact=True).wait_for(timeout=10_000)
+    page.keyboard.press("Escape")
+    page.locator("#fileEditorDialog").wait_for(state="hidden")
+    row.dblclick()
+    assert editor.input_value() == "def answer():\n    return 2\n"
+
+    changed = _mutate_editor_file(page, "example.py", "def answer():\n    return 3\n")
+    assert changed["status"] == 200
+    editor.fill("def answer():\n    return 4\n")
+    page.locator("#editorSave").click()
+    page.locator("#editorConflictDialog").wait_for(timeout=10_000)
+    page.locator("#editorConflictReload").click()
+    page.wait_for_function(
+        "expected => document.querySelector('#fileEditorInput')?.value === expected",
+        arg="def answer():\n    return 3\n",
+    )
+
+    changed = _mutate_editor_file(page, "example.py", "def answer():\n    return 5\n")
+    assert changed["status"] == 200
+    editor.fill("def answer():\n    return 6\n")
+    page.locator("#editorSave").click()
+    page.locator("#editorConflictDialog").wait_for(timeout=10_000)
+    page.locator("#editorConflictForce").click()
+    page.get_by_text("文件已保存", exact=True).wait_for(timeout=10_000)
+    reloaded = page.evaluate(
+        """
+        async () => {
+          const sid = localStorage.getItem("oca.active-session");
+          const headers = {"X-WebAgent-User-ID": localStorage.getItem("webagent.user-id")};
+          const response = await fetch(`/v1/sessions/${encodeURIComponent(sid)}/files/editor/example.py`, {headers});
+          return response.json();
+        }
+        """
+    )
+    assert reloaded["content"] == "def answer():\n    return 6\n"
+
+    page.keyboard.press("Escape")
+    _upload_browser_file(page, tmp_path, "blob.bin", b"a\0b")
+    with page.expect_download(timeout=10_000) as binary_download:
+        page.get_by_role("treeitem", name="blob.bin").dblclick()
+    assert binary_download.value.suggested_filename == "blob.bin"
+
+    _upload_browser_file(page, tmp_path, "large.txt", b"x" * 129)
+    page.get_by_role("treeitem", name="large.txt").dblclick()
+    page.locator("#largeFileDialog").wait_for(timeout=10_000)
+    assert "128 B" in page.locator("#largeFileDialog").inner_text()
+    assert page.locator("#fileEditorInput").count() == 0
+    with page.expect_download(timeout=10_000) as large_download:
+        page.locator("#largeFileDownload").click()
+    assert large_download.value.suggested_filename == "large.txt"
+
+
+def test_upload_limits_block_oversized_and_eleventh_batches_before_post(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    _connect_and_create(page, web_server)
+    file_posts: list[str] = []
+
+    def capture_upload(request) -> None:
+        if request.method == "POST" and request.url.endswith("/files"):
+            file_posts.append(request.url)
+
+    page.on("request", capture_upload)
+    exact = tmp_path / "exact-2mb.bin"
+    exact.write_bytes(b"x" * (2 * 1024 * 1024))
+    page.locator("#fileInput").set_input_files(exact)
+    page.get_by_role("treeitem", name="exact-2mb.bin").wait_for(timeout=10_000)
+    page.get_by_text("已上传 1 / 10", exact=True).wait_for(timeout=10_000)
+    assert len(file_posts) == 1
+
+    oversized = tmp_path / "over-2mb.bin"
+    oversized.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+    page.locator("#fileInput").set_input_files(oversized)
+    page.get_by_text("未上传：单文件上限为 2.0 MB", exact=False).wait_for()
+    assert len(file_posts) == 1
+
+    def reject_server_limit(route) -> None:
+        if route.request.method == "POST":
+            route.fulfill(
+                status=413,
+                content_type="application/json",
+                body=json.dumps({"detail": "服务端拒绝了该文件"}),
+            )
+        else:
+            route.continue_()
+
+    route_pattern = "**/v1/sessions/**/files"
+    page.route(route_pattern, reject_server_limit)
+    server_rejected = tmp_path / "server-rejected.txt"
+    server_rejected.write_text("small", encoding="utf-8")
+    page.locator("#fileInput").set_input_files(server_rejected)
+    page.get_by_text("上传失败：服务端拒绝了该文件", exact=True).wait_for()
+    page.unroute(route_pattern, reject_server_limit)
+
+    remaining = []
+    for number in range(2, 11):
+        source = tmp_path / f"count-{number}.txt"
+        source.write_text(str(number), encoding="utf-8")
+        remaining.append(source)
+    page.locator("#fileInput").set_input_files(remaining)
+    page.get_by_text("已上传 9 个文件", exact=True).wait_for(timeout=10_000)
+    page.get_by_text("已上传 10 / 10", exact=True).wait_for(timeout=10_000)
+    for input_id in ("#fileInput", "#directoryInput"):
+        input_node = page.locator(input_id)
+        assert input_node.is_disabled()
+        assert "disabled" in (input_node.locator("xpath=..").get_attribute("class") or "")
+    assert len(file_posts) == 3
+
+    eleventh = tmp_path / "eleventh.txt"
+    eleventh.write_text("11", encoding="utf-8")
+    page.locator("#fileInput").evaluate("node => node.disabled = false")
+    page.locator("#fileInput").set_input_files(eleventh)
+    page.get_by_text("未上传：Session 最多上传 10 个文件", exact=False).wait_for()
+    assert len(file_posts) == 3
+
+
+@pytest.mark.parametrize("web_server", [32 * 1024], indirect=True)
+def test_file_editor_keeps_long_code_in_an_independent_scroller_at_all_viewports(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    _connect_and_create(page, web_server)
+    content = (
+        "very_long_line = '"
+        + ("x" * 1800)
+        + "'\n"
+        + "\n".join(f"line_{index:03d} = {index}" for index in range(180))
+        + "\n"
+    )
+    _upload_browser_file(page, tmp_path, "long-layout.py", content.encode())
+    page.get_by_role("treeitem", name="long-layout.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    assert page.locator("#fileEditorInput").input_value() == content
+    assert page.locator(".file-editor-line-numbers").inner_text().splitlines() == [
+        str(index) for index in range(1, content.count("\n") + 2)
+    ]
+
+    for width, height in ((1440, 900), (820, 620), (390, 720)):
+        page.set_viewport_size({"width": width, "height": height})
+        page.locator("#fileEditorDialog").wait_for(state="visible")
+        metrics = page.locator("#fileEditorDialog").evaluate(
+            """
+            dialog => {
+              const scroll = dialog.querySelector('#fileEditorScroll');
+              const header = dialog.querySelector('header');
+              const footer = dialog.querySelector('.editor-actions');
+              const reload = footer.querySelector('button');
+              const save = footer.querySelector('#editorSave');
+              const gutter = dialog.querySelector('.file-editor-line-numbers');
+              const input = dialog.querySelector('#fileEditorInput');
+              const rect = (node) => node.getBoundingClientRect();
+              return {
+                viewport: { width: window.innerWidth, height: window.innerHeight },
+                documentWidth: document.documentElement.scrollWidth,
+                scroll: {
+                  clientHeight: scroll.clientHeight,
+                  scrollHeight: scroll.scrollHeight,
+                  clientWidth: scroll.clientWidth,
+                  scrollWidth: scroll.scrollWidth,
+                  top: scroll.scrollTop,
+                },
+                header: rect(header).toJSON(),
+                footer: rect(footer).toJSON(),
+                gutterTop: rect(gutter).top,
+                inputTop: rect(input).top,
+                reloadHeight: rect(reload).height,
+                saveHeight: rect(save).height,
+              };
+            }
+            """
+        )
+        assert metrics["scroll"]["scrollHeight"] > metrics["scroll"]["clientHeight"]
+        assert metrics["scroll"]["scrollWidth"] > metrics["scroll"]["clientWidth"]
+        assert metrics["header"]["top"] >= 0
+        assert metrics["footer"]["bottom"] <= metrics["viewport"]["height"]
+        assert metrics["header"]["bottom"] <= metrics["footer"]["top"]
+        assert metrics["documentWidth"] <= metrics["viewport"]["width"]
+        assert abs(metrics["reloadHeight"] - metrics["saveHeight"]) <= 1
+        shifted = page.locator("#fileEditorScroll").evaluate(
+            """
+            scroll => {
+              const dialog = scroll.closest('#fileEditorDialog');
+              const gutter = dialog.querySelector('.file-editor-line-numbers');
+              const input = dialog.querySelector('#fileEditorInput');
+              const before = { gutter: gutter.getBoundingClientRect().top, input: input.getBoundingClientRect().top };
+              scroll.scrollTop = Math.min(120, scroll.scrollHeight - scroll.clientHeight);
+              return {
+                top: scroll.scrollTop,
+                gutterDelta: gutter.getBoundingClientRect().top - before.gutter,
+                inputDelta: input.getBoundingClientRect().top - before.input,
+              };
+            }
+            """
+        )
+        assert shifted["top"] > 0
+        assert abs(shifted["gutterDelta"] - shifted["inputDelta"]) <= 1
+        page.screenshot(path=f"/tmp/webagent-file-editor-{width}x{height}.png")
+
+
+def test_file_editor_is_read_only_while_its_session_is_running(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        class RunningSocket {
+          static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+          constructor(){this.readyState=0;setTimeout(()=>{this.readyState=1;this.onopen?.()},0)}
+          emit(value){this.onmessage?.({data:JSON.stringify(value)})}
+          send(raw){const message=JSON.parse(raw);if(message.type==='hello')setTimeout(()=>{this.sid=message.session_id;window.__runningEditorSocket=this;this.emit({type:'ready',session_id:this.sid,task_state:'idle',turn_id:null,last_sequence:0})},0)}
+          close(){this.readyState=3}
+        }
+        window.__startRunningEditor = () => window.__runningEditorSocket.emit({type:'ready',session_id:window.__runningEditorSocket.sid,task_state:'running',turn_id:'running-turn',last_sequence:0});
+        window.__finishRunningEditor = () => window.__runningEditorSocket.emit({type:'ready',session_id:window.__runningEditorSocket.sid,task_state:'idle',turn_id:null,last_sequence:0});
+        window.WebSocket = RunningSocket;
+        """
+    )
+    _connect_and_create(page, web_server)
+    _upload_browser_file(page, tmp_path, "busy.py", b"value = 1\n")
+    page.evaluate("window.__startRunningEditor()")
+    page.get_by_role("treeitem", name="busy.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    page.locator("#editorReadOnly").get_by_text("Agent 正在运行", exact=False).wait_for()
+    assert page.locator("#editorSave").is_disabled()
+    assert page.locator("#fileEditorInput").evaluate("node => node.readOnly") is True
+    assert page.locator("#fileEditorInput").evaluate("node => node.disabled") is False
+    editor = page.locator("#fileEditorInput")
+    original_value = editor.input_value()
+    editor.focus()
+    for key in ("Enter", "Tab", "Backspace", "Shift+Digit9", "Control+Z"):
+        if key == "Shift+Digit9":
+            editor.evaluate("node => node.setSelectionRange(0, node.value.length)")
+        page.keyboard.press(key)
+        assert editor.input_value() == original_value
+
+    page.evaluate(
+        """
+        () => {
+          const input = document.querySelector('#fileEditorInput');
+          window.__readonlyEditorCopies = 0;
+          input.addEventListener('copy', () => { window.__readonlyEditorCopies += 1; });
+          input.focus();
+          input.setSelectionRange(0, input.value.length);
+        }
+        """
+    )
+    page.keyboard.press("Control+C")
+    assert page.evaluate("window.__readonlyEditorCopies") == 1
+    assert editor.evaluate(
+        "node => node.selectionStart === 0 && node.selectionEnd === node.value.length"
+    )
+
+    file_posts: list[str] = []
+
+    def capture_file_upload(request) -> None:
+        if request.method == "POST" and request.url.endswith("/files"):
+            file_posts.append(request.url)
+
+    page.on("request", capture_file_upload)
+    for input_id in ("#fileInput", "#directoryInput"):
+        input_node = page.locator(input_id)
+        assert input_node.is_disabled()
+        assert "disabled" in (input_node.locator("xpath=..").get_attribute("class") or "")
+    blocked = tmp_path / "blocked-during-turn.txt"
+    blocked.write_text("must not upload", encoding="utf-8")
+    page.locator("#fileInput").evaluate("node => node.disabled = false")
+    page.locator("#fileInput").set_input_files(blocked)
+    page.get_by_text("Agent 正在运行，暂不能上传文件", exact=True).wait_for()
+    assert file_posts == []
+
+    page.keyboard.press("Escape")
+    page.locator("#fileEditorDialog").wait_for(state="hidden")
+    page.set_viewport_size({"width": 820, "height": 620})
+    page.get_by_role("button", name="打开沙箱文件").click(timeout=5_000)
+    for input_id in ("#drawerfileInput", "#drawerdirectoryInput"):
+        input_node = page.locator(input_id)
+        assert input_node.is_disabled()
+        assert "disabled" in (input_node.locator("xpath=..").get_attribute("class") or "")
+    page.evaluate("window.__finishRunningEditor()")
+    page.wait_for_function(
+        "() => !document.querySelector('#drawerfileInput')?.disabled",
+        timeout=5_000,
+    )
+    assert page.locator("#drawerfileInput").is_enabled()
+    assert page.locator("#drawerdirectoryInput").is_enabled()
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.locator("#fileInput").locator("xpath=..").wait_for(state="visible")
+    assert page.locator("#fileInput").is_enabled()
+    assert page.locator("#directoryInput").is_enabled()
+
+
+def test_file_editor_busy_save_keeps_draft_and_then_enters_conflict_after_idle(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        const nativeFetch = window.fetch.bind(window);
+        let blocked = false;
+        window.fetch = async (input, init = {}) => {
+          const url = String(input);
+          if (!blocked && url.includes('/files/editor/busy-save.py') && init.method === 'PUT') {
+            blocked = true;
+            return new Response(JSON.stringify({
+              detail: 'Session is busy',
+              error: {code: 'session_busy'},
+            }), {
+              status: 409,
+              headers: {'Content-Type': 'application/json'},
+            });
+          }
+          return nativeFetch(input, init);
+        };
+        """
+    )
+    _connect_and_create(page, web_server)
+    _upload_browser_file(page, tmp_path, "busy-save.py", b"value = 1\n")
+    page.get_by_role("treeitem", name="busy-save.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    editor = page.locator("#fileEditorInput")
+    editor.fill("value = 2\n")
+    page.locator("#editorSave").click()
+    page.locator("#editorReadOnly").get_by_text("Agent 正在运行", exact=False).wait_for()
+    assert editor.input_value() == "value = 2\n"
+
+    changed = _mutate_editor_file(page, "busy-save.py", "value = 3\n")
+    assert changed["status"] == 200
+    page.locator("#editorReadOnly").wait_for(state="hidden", timeout=10_000)
+    assert page.locator("#editorSave").is_enabled()
+
+
+def test_file_editor_stale_reload_response_cannot_replace_new_file_after_close(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        const nativeFetch = window.fetch.bind(window);
+        let loads = 0;
+        window.fetch = async (input, init) => {
+          const url = String(input);
+          if (url.includes('/files/editor/slow-a.py') && (!init?.method || init.method === 'GET')) {
+            loads += 1;
+            if (loads >= 2) {
+              await new Promise(resolve => setTimeout(resolve, 250));
+            }
+          }
+          if (url.includes('/files/editor/slow-a.py') && loads >= 2) {
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          return nativeFetch(input, init);
+        };
+        """
+    )
+    _connect_and_create(page, web_server)
+    _upload_browser_file(page, tmp_path, "slow-a.py", b"alpha = 1\n")
+    _upload_browser_file(page, tmp_path, "fast-b.py", b"beta = 2\n")
+    page.get_by_role("treeitem", name="slow-a.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    page.locator("#fileEditorDialog").get_by_role("button", name="重新加载").click()
+    page.evaluate("window.confirm = () => true")
+    page.keyboard.press("Escape")
+    page.locator("#fileEditorDialog").wait_for(state="hidden")
+    page.get_by_role("treeitem", name="fast-b.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    page.wait_for_function(
+        """
+        () => document.querySelector('#fileEditorDialog h2')?.textContent === 'fast-b.py'
+          && document.querySelector('#fileEditorInput')?.value === 'beta = 2\\n'
+        """
+    )
+    page.wait_for_timeout(350)
+    assert page.locator("#fileEditorDialog h2").inner_text() == "fast-b.py"
+    assert page.locator("#fileEditorInput").input_value() == "beta = 2\n"
+
+
+def test_file_editor_reopen_clears_old_success_feedback_before_next_save(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        const nativeFetch = window.fetch.bind(window);
+        let putCount = 0;
+        window.fetch = async (input, init = {}) => {
+          const url = String(input);
+          if (url.includes('/files/editor/feedback.py') && init.method === 'PUT') {
+            putCount += 1;
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          return nativeFetch(input, init);
+        };
+        """
+    )
+    _connect_and_create(page, web_server)
+    _upload_browser_file(page, tmp_path, "feedback.py", b"value = 1\n")
+    page.get_by_role("treeitem", name="feedback.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    editor = page.locator("#fileEditorInput")
+    editor.fill("value = 2\n")
+    page.locator("#editorSave").click()
+    page.evaluate("window.confirm = () => true")
+    page.keyboard.press("Escape")
+    page.locator("#fileEditorDialog").wait_for(state="hidden")
+    page.get_by_role("treeitem", name="feedback.py").dblclick()
+    page.locator("#fileEditorDialog").wait_for(timeout=10_000)
+    assert page.get_by_text("文件已保存", exact=True).count() == 0
+
+
+def test_identity_headers_logout_and_provider_namespaces_are_isolated(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        window.__socketCloses=0;window.__helloMessages=[];
+        const NativeSocket=window.WebSocket;
+        function ObservedSocket(...args){
+          const socket=new NativeSocket(...args), nativeSend=socket.send.bind(socket), nativeClose=socket.close.bind(socket);
+          socket.send=raw=>{const value=JSON.parse(raw);if(value.type==='hello')window.__helloMessages.push(value);return nativeSend(raw)};
+          socket.close=(...closeArgs)=>{window.__socketCloses+=1;return nativeClose(...closeArgs)};
+          return socket;
+        }
+        for(const key of ['CONNECTING','OPEN','CLOSING','CLOSED'])ObservedSocket[key]=NativeSocket[key];
+        window.WebSocket=ObservedSocket;
+        """
+    )
+    user_a = page.request.post(
+        f"{web_server['web']}/v1/admin/users", data={"name": "Alice Browser"}
+    ).json()
+    user_b = page.request.post(
+        f"{web_server['web']}/v1/admin/users", data={"name": "Bob Browser"}
+    ).json()
+    session_headers: list[str | None] = []
+
+    def capture_session_headers(request) -> None:
+        if "/v1/sessions" in request.url:
+            session_headers.append(request.headers.get("x-webagent-user-id"))
+
+    page.on("request", capture_session_headers)
+    page.goto(web_server["web"], wait_until="domcontentloaded")
+    page.locator("#identityName").fill("Alice Browser")
+    page.get_by_role("button", name="进入 WebAgent").click()
+    page.locator("#providerEndpoint").fill(web_server["provider"])
+    page.locator("#providerApiKey").fill("alice-provider-key")
+    page.locator("#testProvider").click()
+    page.locator(".provider-tested").wait_for(state="visible", timeout=10_000)
+    page.locator("#saveProvider").click()
+    page.locator("#newSession").click()
     page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=10_000)
+    page.wait_for_function("window.__helloMessages.length > 0")
+    hello = page.evaluate("window.__helloMessages.at(-1)")
+    assert hello["user_id"] == user_a["user_id"]
+    assert session_headers and all(value == user_a["user_id"] for value in session_headers)
+
+    page.get_by_role("button", name="登出").click()
+    page.locator("#identityName").wait_for(state="visible")
+    assert page.evaluate("localStorage.getItem('webagent.user-id')") is None
+    assert page.evaluate("localStorage.getItem('oca.active-session')") is None
+    assert page.evaluate("window.__socketCloses") >= 1
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.provider-api-key`)",
+            user_a["user_id"],
+        )
+        == "alice-provider-key"
+    )
+
+    page.locator("#identityName").fill("Bob Browser")
+    page.get_by_role("button", name="进入 WebAgent").click()
+    page.locator(".app-shell").wait_for(state="visible")
+    assert page.locator("#providerEndpoint").input_value() == ""
+    assert page.locator("#providerApiKey").input_value() == ""
+    assert page.evaluate("localStorage.getItem('webagent.user-id')") == user_b["user_id"]
+    page.get_by_role("button", name="登出").click()
+
+    page.locator("#identityName").fill("Alice Browser")
+    page.get_by_role("button", name="进入 WebAgent").click()
+    page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=10_000)
+    page.get_by_role("button", name="连接设置").click()
+    assert page.locator("#providerEndpoint").input_value() == web_server["provider"]
+    assert page.locator("#providerApiKey").input_value() == "alice-provider-key"
+
+
+@pytest.mark.parametrize("web_server", [None], indirect=True)
+def test_admin_page_manages_users_sessions_and_restart_settings(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    page.goto(f"{web_server['web']}/admin", wait_until="domcontentloaded")
+    page.get_by_role("heading", name="管理后台", exact=True).wait_for(timeout=10_000)
+    assert page.get_by_text("Provider 凭据由每位用户在浏览器中单独配置", exact=False).is_visible()
+    page.get_by_role("navigation", name="后台分区").get_by_role(
+        "link", name="用户", exact=True
+    ).click()
+    page.get_by_role("textbox", name="新用户姓名").fill("Admin Created")
+    page.get_by_role("button", name="新增用户").click()
+    row = page.locator("tbody tr").filter(has_text="Admin Created")
+    row.wait_for(state="visible")
+    assert "已启用" in row.inner_text()
+    page.get_by_role("textbox", name="新用户姓名").fill("Admin Created")
+    page.get_by_role("button", name="新增用户").click()
+    page.get_by_text("用户名称已存在", exact=True).wait_for()
+    row.get_by_role("button", name="停用").click()
+    row.get_by_text("已停用", exact=True).wait_for()
+    page.get_by_role("navigation", name="后台分区").get_by_role(
+        "link", name="服务设置", exact=True
+    ).click()
+    editor_limit = page.get_by_text("文本编辑器上限（kB）").locator("..").locator("input")
+    assert editor_limit.input_value() == "2048"
+    editor_limit.fill("3584")
+    upload_limit = page.get_by_text("单文件上传上限（kB）").locator("..").locator("input")
+    assert upload_limit.input_value() == "2048"
+    upload_limit.fill("3584")
+    upload_count_limit = (
+        page.get_by_text("Session 累计上传文件数上限").locator("..").locator("input")
+    )
+    assert upload_count_limit.input_value() == "10"
+    upload_count_limit.fill("12")
+    timeout = page.get_by_text("任务超时（秒）").locator("..").locator("input")
+    timeout.fill("321")
+    with page.expect_request(
+        lambda request: request.url.endswith("/v1/admin/settings") and request.method == "PATCH"
+    ) as saved_request:
+        page.get_by_role("button", name="保存设置").click()
+    assert saved_request.value.post_data_json["file_editor_max_bytes"] == 3_670_016
+    assert saved_request.value.post_data_json["file_upload_max_bytes"] == 3_670_016
+    assert saved_request.value.post_data_json["file_upload_max_files_per_session"] == 12
+    page.get_by_text("配置已保存；请重启服务使其生效", exact=True).wait_for()
+    page.get_by_text("等待重启生效", exact=False).wait_for()
+
+
+def test_admin_sections_follow_hash_and_only_render_the_active_view(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    page.set_viewport_size({"width": 390, "height": 720})
+    page.goto(f"{web_server['web']}/admin#users", wait_until="domcontentloaded")
+    page.locator("#users").wait_for(state="visible", timeout=10_000)
+
+    assert page.locator("#overview").count() == 0
+    assert page.locator("#monitor").count() == 0
+    assert page.locator("#sessions").count() == 0
+    assert page.locator("#settings").count() == 0
+    users_link = page.get_by_role("navigation", name="后台分区").get_by_role(
+        "link", name="用户", exact=True
+    )
+    assert users_link.get_attribute("aria-current") == "page"
+
+    page.reload(wait_until="domcontentloaded")
+    page.locator("#users").wait_for(state="visible", timeout=10_000)
+    assert page.url.endswith("/admin#users")
+
+    sessions_link = page.get_by_role("navigation", name="后台分区").get_by_role(
+        "link", name="Sessions", exact=True
+    )
+    sessions_link.click()
+    page.locator("#sessions").wait_for(state="visible")
+    assert page.locator("#users").count() == 0
+    assert sessions_link.get_attribute("aria-current") == "page"
+
+    page.goto(f"{web_server['web']}/admin#unknown", wait_until="domcontentloaded")
+    page.locator("#overview").wait_for(state="visible", timeout=10_000)
+    assert page.url.endswith("/admin#overview")
+    assert page.locator("#monitor, #users, #sessions, #settings").count() == 0
+
+
+def test_admin_monitor_uses_live_contract_and_refreshes_without_leaving_its_view(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    response = page.request.get(f"{web_server['web']}/v1/admin/monitor")
+    assert response.ok
+    report = response.json()
+    assert set(report) == {
+        "status",
+        "generated_at",
+        "sample_interval_seconds",
+        "retention_seconds",
+        "snapshot",
+        "history",
+        "components",
+        "issues",
+        "tasks",
+    }
+    assert report["status"] in {"ok", "degraded", "error"}
+    assert report["sample_interval_seconds"] == 5
+    assert report["retention_seconds"] == 3600
+    assert {component["id"] for component in report["components"]} >= {
+        "sqlite",
+        "docker",
+        "worker_image",
+        "journal",
+        "reaper",
+        "workspace",
+    }
+
+    page.add_init_script(
+        """
+        window.__adminVisibility = 'visible';
+        Object.defineProperty(document, 'visibilityState', {
+          configurable: true,
+          get: () => window.__adminVisibility,
+        });
+        const nativeSetInterval = window.setInterval.bind(window);
+        window.setInterval = (handler, delay, ...args) => {
+          if (delay === 5000) {
+            window.__adminPollDelay = delay;
+            return nativeSetInterval(handler, 50, ...args);
+          }
+          return nativeSetInterval(handler, delay, ...args);
+        };
+        const nativeFetch = window.fetch.bind(window);
+        window.__adminMonitorFetches = 0;
+        window.fetch = (...args) => {
+          if (String(args[0]).endsWith('/v1/admin/monitor')) {
+            window.__adminMonitorFetches += 1;
+          }
+          return nativeFetch(...args);
+        };
+        """
+    )
+    page.goto(f"{web_server['web']}/admin#monitor", wait_until="domcontentloaded")
+    page.locator("#monitor").wait_for(state="visible", timeout=10_000)
+    page.get_by_role("heading", name="组件健康", exact=True).wait_for()
+    page.get_by_text("Docker 未启用", exact=True).wait_for(timeout=10_000)
+    assert page.get_by_text("Docker 不可用", exact=True).count() == 0
+    docker_card = page.locator("section.admin-card").filter(
+        has=page.get_by_role("heading", name="容器负载", exact=True)
+    )
+    assert docker_card.locator("dd").all_inner_texts() == ["0", "—", "—", "—"]
+    assert page.locator("#overview, #users, #sessions, #settings").count() == 0
+    assert page.get_by_role("checkbox", name="5 秒自动刷新").is_checked()
+    page.wait_for_function("window.__adminMonitorFetches >= 2")
+    assert page.evaluate("window.__adminPollDelay") == 5000
+
+    page.evaluate(
+        """
+        window.__adminVisibility = 'hidden';
+        document.dispatchEvent(new Event('visibilitychange'));
+        """
+    )
+    page.wait_for_timeout(100)
+    hidden_fetches = page.evaluate("window.__adminMonitorFetches")
+    page.wait_for_timeout(200)
+    assert page.evaluate("window.__adminMonitorFetches") == hidden_fetches
+
+    page.get_by_role("checkbox", name="5 秒自动刷新").uncheck()
+    with page.expect_request(lambda request: request.url.endswith("/v1/admin/monitor")):
+        page.get_by_role("button", name="立即刷新", exact=True).click()
+    page.get_by_role("button", name="立即刷新", exact=True).wait_for(state="visible")
+
+    page.reload(wait_until="domcontentloaded")
+    page.locator("#monitor").wait_for(state="visible", timeout=10_000)
+    assert page.url.endswith("/admin#monitor")
+    page.wait_for_function("window.__adminMonitorFetches >= 2")
+    page.get_by_role("navigation", name="后台分区").get_by_role(
+        "link", name="用户", exact=True
+    ).click()
+    page.locator("#users").wait_for(state="visible")
+    assert page.locator("#monitor").count() == 0
+    page.wait_for_timeout(100)
+    fetches_after_leaving = page.evaluate("window.__adminMonitorFetches")
+    page.wait_for_timeout(200)
+    assert page.evaluate("window.__adminMonitorFetches") == fetches_after_leaving
+
+    page.set_viewport_size({"width": 390, "height": 720})
+    page.get_by_role("navigation", name="后台分区").get_by_role(
+        "link", name="监控", exact=True
+    ).click()
+    summary = page.locator(".monitor-summary")
+    summary.wait_for(state="visible")
+    page.get_by_text("Docker 未启用", exact=True).wait_for(timeout=10_000)
+    assert summary.get_by_text("总体状态", exact=True).is_visible()
+    assert page.evaluate(
+        "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+    )
+
+
+def test_restored_disabled_identity_is_rejected_by_users_me(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    user_id = _login(page, web_server, "Soon Disabled")
+    response = page.request.patch(
+        f"{web_server['web']}/v1/admin/users/{user_id}", data={"enabled": False}
+    )
+    assert response.ok
+    page.reload(wait_until="domcontentloaded")
+    page.locator("#identityName").wait_for(state="visible", timeout=10_000)
+    assert page.evaluate("localStorage.getItem('webagent.user-id')") is None
+    assert page.evaluate("localStorage.getItem('webagent.user-name')") is None
 
 
 def test_connect_uses_visible_mobile_new_session_entrypoint(
@@ -204,21 +1038,11 @@ def test_real_session_model_files_chat_log_and_reload(
     row.wait_for(timeout=10_000)
     row.click()
     assert "selected" not in (row.get_attribute("class") or "")
-    with page.expect_download(timeout=10_000) as download_info:
-        row.dblclick()
-    download = download_info.value
-    assert download.suggested_filename == "single.txt"
-    assert Path(download.path()).read_text(encoding="utf-8") == "来自浏览器的文件\n"
-
-    active_html = tmp_path / "danger.html"
-    active_html.write_text("<script>window.opener.__htmlExecuted=true</script>", encoding="utf-8")
-    page.locator("#fileInput").set_input_files(active_html)
-    html_row = page.get_by_role("treeitem", name="danger.html")
-    html_row.wait_for(timeout=10_000)
-    with page.expect_download(timeout=10_000) as html_download_info:
-        html_row.dblclick()
-    assert html_download_info.value.suggested_filename == "danger.html"
-    assert page.evaluate("window.__htmlExecuted") is None
+    row.dblclick()
+    page.locator("#fileEditorDialog").wait_for(state="visible", timeout=10_000)
+    assert page.locator("#fileEditorInput").input_value() == "来自浏览器的文件\n"
+    page.locator("#fileEditorDialog").get_by_role("button", name="关闭").click()
+    page.locator("#fileEditorDialog").wait_for(state="hidden")
 
     project = tmp_path / "project"
     (project / "src").mkdir(parents=True)
@@ -291,19 +1115,19 @@ def test_real_session_model_files_chat_log_and_reload(
 
     page.locator("#openLog").click()
     page.locator("#logDialog").wait_for(state="visible")
-    assert "详细诊断" in page.locator("#logDialog").inner_text()
-    assert session_id in page.locator("#logDialog h2").inner_text()
+    assert "Session 日志" in page.locator("#logDialog").inner_text()
+    assert session_id[:8] in page.locator("#logSessionId").inner_text()
     assert page.locator("#sessionLogFrame").get_attribute("sandbox") == ""
     assert page.locator("#logDialog .dialog-note").inner_text() == (
         "按实际执行顺序展示用户输入、模型输出、工具参数与结果。"
     )
     log_body = page.locator("#sessionLogFrame").content_frame.locator("body")
     log_body.wait_for(state="visible")
-    log_text = log_body.inner_text()
+    log_text = log_body.text_content() or ""
     assert "运行时诊断：browser.smoke" in log_text
-    assert "用户消息" in log_text
+    assert "用户输入" in log_text
     assert "创建一个计算器，实现加法并运行测试" in log_text
-    assert "Claude Code 输出" in log_text
+    assert "Assistant 输出" in log_text
     page.keyboard.press("Escape")
     assert page.locator("#logDialog").is_hidden()
 
@@ -316,6 +1140,118 @@ def test_real_session_model_files_chat_log_and_reload(
     page.locator(".topbar h1").get_by_text("新会话", exact=True).wait_for(timeout=5_000)
     page.locator(".session-row").filter(has_text="创建一个计算器，实现加法并运行测试").click()
     assert page.locator(".topbar h1").inner_text() == "创建一个计算器，实现加法并运行测试"
+
+
+def test_session_log_viewer_fills_the_viewport_and_refreshes_long_html(
+    web_server: dict[str, str], browser_page: Page, tmp_path: Path
+) -> None:
+    page = browser_page
+    _connect_and_create(page, web_server)
+    session_id = page.evaluate("localStorage.getItem('oca.active-session')")
+    long_content = "\n".join(f"long diagnostic line {index}" for index in range(500))
+    with sqlite3.connect(tmp_path / "browser.db") as database:
+        database.execute(
+            """
+            INSERT INTO session_log_entries
+                (session_id, created_at, title, content, metadata_json, event_type)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                "2026-08-11T00:00:00+00:00",
+                "长日志",
+                long_content,
+                "{}",
+                "browser.long-log",
+            ),
+        )
+
+    log_requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: (
+            log_requests.append(request.url)
+            if request.method == "GET" and request.url.endswith("/log")
+            else None
+        ),
+    )
+    page.locator("#openLog").click()
+    page.locator("#logDialog").wait_for(state="visible")
+    frame = page.locator("#sessionLogFrame").content_frame
+    log_body = frame.locator("body")
+    log_body.wait_for(state="visible", timeout=10_000)
+    expect(log_body).to_contain_text("long diagnostic line 499", timeout=10_000)
+    log_body.evaluate(
+        "body => body.querySelectorAll('details').forEach(detail => { detail.open = true; })"
+    )
+    assert len(log_requests) == 1
+    assert page.locator("#logDialog h2").inner_text().endswith("· Session 日志")
+    assert page.locator("#logSessionId").inner_text() == f"Session {session_id[:8]}"
+    assert page.get_by_role("button", name="刷新", exact=True).is_visible()
+    assert page.get_by_role("button", name="关闭日志").is_visible()
+
+    with sqlite3.connect(tmp_path / "browser.db") as database:
+        database.execute(
+            """
+            INSERT INTO session_log_entries
+                (session_id, created_at, title, content, metadata_json, event_type)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                "2026-08-11T00:00:01+00:00",
+                "刷新日志",
+                "刷新后出现的诊断内容",
+                "{}",
+                "browser.refreshed-log",
+            ),
+        )
+    page.locator("#refreshLog").click()
+    expect(log_body).to_contain_text("刷新后出现的诊断内容", timeout=10_000)
+    log_body.evaluate(
+        "body => body.querySelectorAll('details').forEach(detail => { detail.open = true; })"
+    )
+    assert len(log_requests) >= 2
+
+    for width, height in ((1440, 900), (820, 620), (390, 720)):
+        page.set_viewport_size({"width": width, "height": height})
+        metrics = page.locator("#logDialog").evaluate(
+            """
+            dialog => {
+              const header = dialog.querySelector('.session-log-header');
+              const frame = dialog.querySelector('#sessionLogFrame');
+              const rect = (node) => node.getBoundingClientRect();
+              return {
+                viewport: {width: innerWidth, height: innerHeight},
+                documentWidth: document.documentElement.scrollWidth,
+                dialog: rect(dialog).toJSON(),
+                header: rect(header).toJSON(),
+                frame: rect(frame).toJSON(),
+              };
+            }
+            """
+        )
+        assert metrics["dialog"]["top"] >= 0
+        assert metrics["dialog"]["bottom"] <= metrics["viewport"]["height"]
+        assert metrics["header"]["top"] >= metrics["dialog"]["top"]
+        assert metrics["frame"]["bottom"] <= metrics["dialog"]["bottom"]
+        assert metrics["frame"]["height"] > 200
+        assert metrics["documentWidth"] <= metrics["viewport"]["width"]
+        scroll_metrics = frame.locator("html").evaluate(
+            """
+            () => {
+              const scroll = document.scrollingElement;
+              scroll.scrollTop = Math.min(200, scroll.scrollHeight - scroll.clientHeight);
+              return {top: scroll.scrollTop, height: scroll.scrollHeight, client: scroll.clientHeight};
+            }
+            """
+        )
+        assert scroll_metrics["height"] > scroll_metrics["client"]
+        assert scroll_metrics["top"] > 0
+        page.screenshot(path=f"/tmp/webagent-session-log-{width}x{height}.png")
+
+    page.get_by_role("button", name="关闭日志").click()
+    page.locator("#logDialog").wait_for(state="hidden")
 
 
 def test_late_log_response_cannot_open_for_another_session(
@@ -350,8 +1286,8 @@ def test_late_log_response_cannot_open_for_another_session(
 
     page.locator("#openLog").click()
     page.locator("#logDialog").wait_for(state="visible", timeout=5_000)
-    assert session_b in page.locator("#logDialog h2").inner_text()
-    assert session_a not in page.locator("#logDialog h2").inner_text()
+    assert page.locator("#logSessionId").inner_text() == f"Session {session_b[:8]}"
+    assert session_a[:8] not in page.locator("#logSessionId").inner_text()
 
 
 def test_file_tree_fold_state_is_isolated_between_sessions_with_the_same_paths(
@@ -529,9 +1465,16 @@ def test_progress_steps_are_visible_before_delta_independent_and_stopped(
     delete_item = page.get_by_role("menuitem", name="删除会话")
     assert delete_item.is_visible()
     assert delete_item.is_disabled()
+    rename_item = page.get_by_role("menuitem", name="重命名")
+    assert rename_item.is_enabled()
     assert page.get_by_text("请先停止当前任务", exact=True).is_visible()
     page.keyboard.press("Escape")
     assert delete_item.is_hidden()
+    page.locator(".session-row.selected").click(button="right")
+    rename_item.click()
+    page.locator("#renameSessionTitle").fill("运行中也能重命名")
+    page.locator("#renameSessionTitle").press("Enter")
+    page.locator(".topbar h1").get_by_text("运行中也能重命名", exact=True).wait_for()
     page.get_by_role("button", name="停止").last.click()
     page.get_by_text("已停止", exact=False).first.wait_for(timeout=5_000)
     assert page.locator('.step-row[data-status="stopped"]').count() == 2
@@ -660,14 +1603,14 @@ def test_disconnect_keeps_running_state_replays_and_can_stop_after_reconnect(
     page.locator("#prompt").fill("启动后模拟断线")
     page.locator("#prompt").press("Enter")
     page.get_by_text("执行长任务", exact=True).wait_for(timeout=5_000)
-    page.locator("#connectionBadge b").get_by_text("重新连接", exact=True).wait_for(timeout=5_000)
+    page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=5_000)
     assert "正在工作" in page.locator(".task-card").inner_text()
     assert "正在停止" not in page.locator(".task-card").inner_text()
+    page.get_by_text("连接恢复后即可停止任务", exact=True).first.wait_for(timeout=5_000)
     assert page.locator("#sendButton").is_disabled()
     assert page.locator(".task-card .stop-inline").is_disabled()
-    page.get_by_text("连接恢复后即可停止任务", exact=True).first.wait_for(timeout=5_000)
     assert page.evaluate("window.__reconnectedStopTurn") is None
-    page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=5_000)
+    page.wait_for_function("window.WebSocket.count > 1", timeout=5_000)
     assert page.locator("#sendButton").get_by_text("停止", exact=True).is_visible()
     assert page.locator("#sendButton").is_enabled()
     page.get_by_role("button", name="停止").last.click()
@@ -996,7 +1939,7 @@ def test_provider_catalog_failure_stays_in_settings_and_can_recover(
     web_server: dict[str, str], browser_page: Page
 ) -> None:
     page = browser_page
-    page.goto(web_server["web"], wait_until="domcontentloaded")
+    user_id = _login(page, web_server)
     page.locator("#connectionBadge b").get_by_text("未配置", exact=True).wait_for(timeout=5_000)
     assert page.locator(".connection-popover").is_visible()
     page.locator("#newSession").click()
@@ -1016,7 +1959,13 @@ def test_provider_catalog_failure_stays_in_settings_and_can_recover(
     page.locator(".provider-tested").wait_for(state="visible", timeout=10_000)
     page.locator("#saveProvider").click()
     page.locator(".connection-popover").wait_for(state="hidden", timeout=10_000)
-    assert page.evaluate("localStorage.getItem('oca.provider-auth-env')") == "ANTHROPIC_API_KEY"
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.provider-auth-env`)",
+            user_id,
+        )
+        == "ANTHROPIC_API_KEY"
+    )
     page.locator("#newSession").click()
     page.locator("#connectionBadge b").get_by_text("已连接", exact=True).wait_for(timeout=10_000)
 
@@ -1054,9 +2003,9 @@ def test_provider_settings_require_test_before_saving_defaults_and_restore_on_re
     page.route("**/v1/web/models", route_models)
     page.on("request", capture_session)
     page.set_viewport_size({"width": 430, "height": 800})
-    page.goto(web_server["web"], wait_until="domcontentloaded")
+    _login(page, web_server)
     assert page.locator(".brand strong").inner_text() == "WebAgent"
-    assert page.locator(".brand small").inner_text() == "@Username"
+    assert page.locator(".brand small").inner_text() == "Browser User"
     assert page.locator(".topbar h1").inner_text() == "WebAgent"
     assert page.locator("#saveProvider").is_disabled()
     assert page.locator(".provider-tested").count() == 0
@@ -1074,7 +2023,13 @@ def test_provider_settings_require_test_before_saving_defaults_and_restore_on_re
     page.locator("#testProvider").click()
     page.get_by_text("受控 Provider 连接失败", exact=True).wait_for(timeout=5_000)
     assert page.locator("#saveProvider").is_disabled()
-    assert page.evaluate("localStorage.getItem('oca.provider-endpoint')") is None
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.provider-endpoint`)",
+            page.evaluate("localStorage.getItem('webagent.user-id')"),
+        )
+        is None
+    )
 
     page.locator("#providerEndpoint").fill("https://working.example")
     assert page.locator(".provider-tested").count() == 0
@@ -1107,8 +2062,20 @@ def test_provider_settings_require_test_before_saving_defaults_and_restore_on_re
     page.locator("#providerDefaultEffort").select_option("high")
     assert page.locator("#saveProvider").is_enabled()
     page.locator("#saveProvider").click()
-    assert page.evaluate("localStorage.getItem('oca.default-model')") == "controlled-model-b"
-    assert page.evaluate("localStorage.getItem('oca.default-effort')") == "high"
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.default-model`)",
+            page.evaluate("localStorage.getItem('webagent.user-id')"),
+        )
+        == "controlled-model-b"
+    )
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.default-effort`)",
+            page.evaluate("localStorage.getItem('webagent.user-id')"),
+        )
+        == "high"
+    )
 
     page.set_viewport_size({"width": 1440, "height": 900})
     page.locator("#newSession").click()
@@ -1811,9 +2778,13 @@ def test_deleted_sessions_are_hidden_and_never_restored_as_active_selection(
     created = page.evaluate(
         """
         async ({activeId}) => {
-          const json = (path, options={}) => fetch(path, {
-            ...options,
-            headers: {'Content-Type':'application/json', ...(options.headers||{})},
+              const json = (path, options={}) => fetch(path, {
+                ...options,
+                headers: {
+                  'Content-Type':'application/json',
+                  'X-WebAgent-User-ID':localStorage.getItem('webagent.user-id'),
+                  ...(options.headers||{}),
+                },
           }).then(response => response.json());
           await json(`/v1/sessions/${activeId}`, {
             method:'PATCH', body:JSON.stringify({title:'Active visible'}),
@@ -1844,7 +2815,7 @@ def test_deleted_sessions_are_hidden_and_never_restored_as_active_selection(
             (created["incompatibleId"],),
         ).fetchone()
         metadata = json.loads(row[0])
-        metadata["runtime_backend"] = "ZhipuRuntime"
+        metadata["runtime_backend"] = "LegacyRuntime"
         database.execute(
             "UPDATE sessions SET metadata_json = ? WHERE session_id = ?",
             (json.dumps(metadata), created["incompatibleId"]),
@@ -1887,7 +2858,7 @@ def test_provider_test_ignores_stale_response_after_draft_changes(
         };
         """
     )
-    page.goto(web_server["web"], wait_until="domcontentloaded")
+    _login(page, web_server)
     page.locator("#providerEndpoint").fill("https://first.example")
     page.locator("#providerApiKey").fill("first-key")
     page.locator("#testProvider").click()
@@ -1918,12 +2889,20 @@ def test_late_startup_provider_catalog_cannot_overwrite_saved_new_provider(
     web_server: dict[str, str], browser_page: Page
 ) -> None:
     page = browser_page
+    user = page.request.post(
+        f"{web_server['web']}/v1/admin/users", data={"name": "Startup User"}
+    ).json()
     page.add_init_script(
         """
-        localStorage.setItem('oca.provider-endpoint','https://old.example');
-        localStorage.setItem('oca.provider-api-key','old-key');
-        localStorage.setItem('oca.provider-auth-env','ANTHROPIC_AUTH_TOKEN');
-        localStorage.setItem('oca.default-model','old-model');
+        {
+        const user=__USER__;
+        localStorage.setItem('webagent.user-id',user.user_id);
+        localStorage.setItem('webagent.user-name',user.name);
+        const key=name=>`webagent.user.${user.user_id}.${name}`;
+        localStorage.setItem(key('oca.provider-endpoint'),'https://old.example');
+        localStorage.setItem(key('oca.provider-api-key'),'old-key');
+        localStorage.setItem(key('oca.provider-auth-env'),'ANTHROPIC_AUTH_TOKEN');
+        localStorage.setItem(key('oca.default-model'),'old-model');
         window.__startupCatalogs=[];
         const nativeFetch=window.fetch.bind(window);
         window.fetch=(input,init={})=>{
@@ -1936,7 +2915,8 @@ def test_late_startup_provider_catalog_cannot_overwrite_saved_new_provider(
         window.__resolveStartupCatalog=(index,payload)=>window.__startupCatalogs[index].resolve(
           new Response(JSON.stringify(payload),{status:200,headers:{'Content-Type':'application/json'}})
         );
-        """
+        }
+        """.replace("__USER__", json.dumps(user))
     )
     page.goto(web_server["web"], wait_until="domcontentloaded")
     page.wait_for_function("window.__startupCatalogs.length === 1")
@@ -1955,8 +2935,20 @@ def test_late_startup_provider_catalog_cannot_overwrite_saved_new_provider(
         "window.__resolveStartupCatalog(0,{models:['old-model'],default_model:'old-model'})"
     )
     page.wait_for_timeout(100)
-    assert page.evaluate("localStorage.getItem('oca.provider-endpoint')") == "https://new.example"
-    assert page.evaluate("localStorage.getItem('oca.default-model')") == "new-b"
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.provider-endpoint`)",
+            user["user_id"],
+        )
+        == "https://new.example"
+    )
+    assert (
+        page.evaluate(
+            "userId => localStorage.getItem(`webagent.user.${userId}.oca.default-model`)",
+            user["user_id"],
+        )
+        == "new-b"
+    )
     page.locator("#newSession").click()
     page.wait_for_function("document.querySelector('.session-row.selected') !== null")
     assert "new-b" in page.locator(".model-trigger").inner_text()
@@ -2045,6 +3037,7 @@ def test_session_context_menu_delete_cancel_nonactive_and_active_switch(
     assert box["y"] + box["height"] <= 900
     page.keyboard.press("Escape")
     assert menu.is_hidden()
+    assert page.evaluate("document.activeElement.dataset.sessionId") == second_id
 
     second_row.click(button="right")
     page.once("dialog", lambda dialog: dialog.dismiss())
@@ -2067,6 +3060,174 @@ def test_session_context_menu_delete_cancel_nonactive_and_active_switch(
     assert deleted_urls[-1].endswith(f"/v1/sessions/{third_id}")
     page.locator(".topbar h1").get_by_text("First session", exact=True).wait_for(timeout=5_000)
     assert page.evaluate("localStorage.getItem('oca.active-session')") == first_id
+
+
+def test_session_context_menu_renames_isolated_sessions_and_manual_name_wins_auto_title(
+    web_server: dict[str, str], browser_page: Page
+) -> None:
+    page = browser_page
+    page.add_init_script(
+        """
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = (input, init = {}) => {
+          const url = String(input);
+          const body = init.body ? JSON.parse(init.body) : null;
+          if (window.__delaySessionList && url.endsWith('/v1/sessions') && !init.method) {
+            window.__delaySessionList = false;
+            return new Promise(async resolve => {
+              const staleResponse = await nativeFetch(input, init);
+              window.__resolveDelayedSessionList = () => resolve(staleResponse);
+              window.__delayedSessionListReady = true;
+            });
+          }
+          if (url.includes('/v1/sessions/') && init.method === 'PATCH' && body?.title === 'Will fail') {
+            return Promise.resolve(new Response(JSON.stringify({detail: '重命名服务暂不可用'}), {status: 500, headers: {'Content-Type': 'application/json'}}));
+          }
+          if (url.includes('/v1/sessions/') && init.method === 'PATCH' && body?.title === 'Delayed save') {
+            return new Promise(resolve => {
+              window.__resolveDelayedRename = () => resolve(new Response(JSON.stringify({session_id: url.split('/').at(-1), title: 'Delayed save'}), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          if (url.includes('/v1/sessions/') && init.method === 'PATCH' && body?.title === '自动标题任务') {
+            return new Promise((resolve, reject) => {
+              nativeFetch(input, init).then(response => {
+                // The server has already committed the automatic title.  Hold
+                // the response so the UI still considers that PATCH pending.
+                window.__autoTitleServerCommitted = true;
+                window.__resolveAutoTitle = () => resolve(response);
+                window.__autoTitlePending = true;
+              }, reject);
+            });
+          }
+          if (url.includes('/v1/sessions/') && init.method === 'PATCH' && body?.title === '手动优先')
+            window.__manualRenameRequests = (window.__manualRenameRequests || 0) + 1;
+          return nativeFetch(input, init);
+        };
+        """
+    )
+    _connect_and_create(page, web_server)
+    first_id = page.evaluate("localStorage.getItem('oca.active-session')")
+    page.locator("#newSession").click()
+    page.wait_for_function(
+        "old => localStorage.getItem('oca.active-session') !== old", arg=first_id
+    )
+    second_id = page.evaluate("localStorage.getItem('oca.active-session')")
+    page.locator("#newSession").click()
+    page.wait_for_function(
+        "old => localStorage.getItem('oca.active-session') !== old", arg=second_id
+    )
+    third_id = page.evaluate("localStorage.getItem('oca.active-session')")
+    page.evaluate(
+        """
+        async entries => {
+          for (const [sessionId, title] of entries) {
+            await fetch(`/v1/sessions/${sessionId}`, {
+              method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({title})
+            });
+          }
+        }
+        """,
+        [[first_id, "First"], [second_id, "Second"], [third_id, "Current"]],
+    )
+    page.reload(wait_until="domcontentloaded")
+    page.locator(".topbar h1").get_by_text("Current", exact=True).wait_for(timeout=10_000)
+
+    second_row = page.locator(f'.session-row[data-session-id="{second_id}"]')
+    second_row.focus()
+    second_row.press("ContextMenu")
+    rename_item = page.get_by_role("menuitem", name="重命名")
+    rename_item.wait_for(state="visible")
+    page.wait_for_function("document.activeElement?.id === 'renameSessionMenuItem'", timeout=5_000)
+    rename_item.click()
+    title_input = page.locator("#renameSessionTitle")
+    assert title_input.input_value() == "Second"
+    title_input.fill("  Renamed second  ")
+    title_input.press("Enter")
+    page.locator("#renameSessionDialog").wait_for(state="hidden")
+    second_row.get_by_text("Renamed second", exact=True).wait_for(timeout=5_000)
+    assert page.locator(".topbar h1").inner_text() == "Current"
+
+    third_row = page.locator(f'.session-row[data-session-id="{third_id}"]')
+    third_row.focus()
+    third_row.press("Shift+F10")
+    page.get_by_role("menuitem", name="重命名").click()
+    title_input.fill("Current renamed")
+    title_input.press("Enter")
+    page.locator(".topbar h1").get_by_text("Current renamed", exact=True).wait_for()
+    assert page.evaluate("localStorage.getItem('oca.active-session')") == third_id
+
+    first_row = page.locator(f'.session-row[data-session-id="{first_id}"]')
+    first_row.click(button="right")
+    page.get_by_role("menuitem", name="重命名").click()
+    title_input.fill("  ")
+    assert page.locator("#confirmRenameSession").is_disabled()
+    assert title_input.input_value() == "  "
+    title_input.press("Escape")
+    page.locator("#renameSessionDialog").wait_for(state="hidden")
+    page.wait_for_function(
+        "sessionId => document.activeElement?.dataset.sessionId === sessionId",
+        arg=first_id,
+    )
+    first_row.click(button="right")
+    page.get_by_role("menuitem", name="重命名").click()
+    title_input.fill("Cancelled")
+    page.get_by_role("button", name="取消").click()
+    page.locator("#renameSessionDialog").wait_for(state="hidden")
+    assert first_row.get_by_text("First", exact=True).is_visible()
+    page.wait_for_function(
+        "sessionId => document.activeElement?.dataset.sessionId === sessionId",
+        arg=first_id,
+        timeout=5_000,
+    )
+
+    first_row.press("ContextMenu")
+    page.get_by_role("menuitem", name="重命名").click()
+    title_input.fill("Will fail")
+    page.locator("#confirmRenameSession").click()
+    page.get_by_text("重命名失败：重命名服务暂不可用", exact=True).wait_for()
+    assert title_input.input_value() == "Will fail"
+    title_input.press("Escape")
+    page.locator("#renameSessionDialog").wait_for(state="hidden")
+    assert first_row.get_by_text("First", exact=True).is_visible()
+
+    first_row.press("ContextMenu")
+    page.get_by_role("menuitem", name="重命名").click()
+    title_input.fill("Delayed save")
+    page.locator("#confirmRenameSession").click()
+    page.get_by_text("正在保存…", exact=True).wait_for()
+    assert page.locator("#renameSessionDialog").get_by_role("button", name="关闭").is_disabled()
+    page.keyboard.press("Escape")
+    page.locator(".modal-backdrop").click(position={"x": 1, "y": 1})
+    assert page.locator("#renameSessionDialog").is_visible()
+    assert title_input.input_value() == "Delayed save"
+    page.evaluate("window.__resolveDelayedRename()")
+    page.locator("#renameSessionDialog").wait_for(state="hidden")
+    assert first_row.get_by_text("Delayed save", exact=True).is_visible()
+
+    page.locator("#newSession").click()
+    page.evaluate("window.__delaySessionList = true")
+    page.locator("#prompt").fill("自动标题任务")
+    page.locator("#prompt").press("Enter")
+    page.wait_for_function("window.__autoTitlePending === true")
+    page.wait_for_function("window.__autoTitleServerCommitted === true")
+    page.wait_for_function("window.__delayedSessionListReady === true")
+    auto_id = page.evaluate("localStorage.getItem('oca.active-session')")
+    auto_row = page.locator(f'.session-row[data-session-id="{auto_id}"]')
+    auto_row.click(button="right")
+    page.get_by_role("menuitem", name="重命名").click()
+    title_input.fill("手动优先")
+    title_input.press("Enter")
+    page.get_by_text("正在保存…", exact=True).wait_for()
+    assert page.evaluate("window.__manualRenameRequests || 0") == 0
+    page.evaluate("window.__resolveAutoTitle()")
+    page.wait_for_function("window.__manualRenameRequests === 1")
+    page.locator(".topbar h1").get_by_text("手动优先", exact=True).wait_for()
+    page.evaluate("window.__resolveDelayedSessionList()")
+    page.wait_for_timeout(100)
+    assert auto_row.get_by_text("手动优先", exact=True).is_visible()
+    assert page.locator(".topbar h1").inner_text() == "手动优先"
+    page.reload(wait_until="domcontentloaded")
+    page.locator(".topbar h1").get_by_text("手动优先", exact=True).wait_for(timeout=10_000)
 
 
 def test_slow_session_creation_disables_composer_and_cannot_send_to_old_socket(

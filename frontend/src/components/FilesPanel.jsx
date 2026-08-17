@@ -171,6 +171,9 @@ export default function FilesPanel({
   query,
   setQuery,
   busy,
+  uploadDisabled,
+  uploadedFileCount = 0,
+  uploadLimit = 0,
   feedback,
   onRefresh,
   onUpload,
@@ -178,6 +181,17 @@ export default function FilesPanel({
   onClose,
   inputPrefix = "",
 }) {
+  const normalizedCount = Math.max(0, Number(uploadedFileCount) || 0);
+  const normalizedLimit = Math.max(0, Number(uploadLimit) || 0);
+  const limitReached =
+    normalizedLimit > 0 && normalizedCount >= normalizedLimit;
+  const uploadUnavailable =
+    !sessionId || busy || uploadDisabled || limitReached;
+  const selectUploads = (event) => {
+    const selected = Array.from(event.target.files || []);
+    event.target.value = "";
+    onUpload(selected);
+  };
   return (
     <aside className="files-panel">
       <header>
@@ -198,7 +212,10 @@ export default function FilesPanel({
         />
       </label>
       <div className="file-actions">
-        <label className="action-button">
+        <label
+          className={`action-button ${uploadUnavailable ? "disabled" : ""}`}
+          aria-disabled={uploadUnavailable}
+        >
           <UploadSimple />
           上传文件
           <input
@@ -206,11 +223,14 @@ export default function FilesPanel({
             hidden
             type="file"
             multiple
-            disabled={!sessionId || busy}
-            onChange={(event) => onUpload(event.target.files)}
+            disabled={uploadUnavailable}
+            onChange={selectUploads}
           />
         </label>
-        <label className="action-button">
+        <label
+          className={`action-button ${uploadUnavailable ? "disabled" : ""}`}
+          aria-disabled={uploadUnavailable}
+        >
           <FolderPlus />
           上传目录
           <input
@@ -220,8 +240,8 @@ export default function FilesPanel({
             multiple
             webkitdirectory=""
             directory=""
-            disabled={!sessionId || busy}
-            onChange={(event) => onUpload(event.target.files)}
+            disabled={uploadUnavailable}
+            onChange={selectUploads}
           />
         </label>
         <IconButton
@@ -232,6 +252,9 @@ export default function FilesPanel({
           <ArrowClockwise className={busy ? "spin" : ""} />
         </IconButton>
       </div>
+      <p className="file-upload-usage" aria-live="polite">
+        已上传 {normalizedCount} / {normalizedLimit || "—"}
+      </p>
       {feedback && (
         <div className="file-feedback" role="status">
           {feedback}

@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "INFO"
-    api_key: str = "demo-local-key"
     runtime_backend: str = "fake"
     database_url: str = "sqlite:///./data/demo.db"
     sandbox_backend: str = "docker"
@@ -33,50 +32,12 @@ class Settings(BaseSettings):
     session_delete_workspace: bool = True
     fake_stream_delay_ms: int = Field(default=80, ge=0)
     fake_long_task_delay_ms: int = Field(default=500, ge=0)
-    zhipu_api_key: str | None = None
-    zhipu_model: str = "glm-4.5-air"
-    zhipu_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
-    claude_api_key: str | None = None
-    claude_base_url: str | None = None
-    claude_model: str | None = None
-    claude_available_models: str = ""
-    model_catalog_cache_seconds: int = Field(default=300, ge=0)
-    claude_auth_env: str = "ANTHROPIC_API_KEY"
     claude_command: str = "claude"
     claude_sdk_runner: str = "/usr/local/bin/oca-agent-sdk-runner"
     claude_timeout_seconds: int = Field(default=600, ge=30)
-
-    @property
-    def selectable_models(self) -> tuple[str, ...]:
-        configured = tuple(
-            dict.fromkeys(
-                model.strip() for model in self.claude_available_models.split(",") if model.strip()
-            )
-        )
-        if configured:
-            return configured
-        if self.runtime_backend in {"claude", "claude-cli"} and self.claude_model:
-            return (self.claude_model,)
-        if self.runtime_backend == "zhipu":
-            return (self.zhipu_model,)
-        return ("claude-code-agent",)
-
-    @property
-    def model_catalog_fallback_models(self) -> tuple[str, ...]:
-        """Provider model names usable if remote model discovery is unavailable."""
-        configured = tuple(
-            dict.fromkeys(
-                model.strip() for model in self.claude_available_models.split(",") if model.strip()
-            )
-        )
-        if self.claude_model:
-            return tuple(dict.fromkeys((self.claude_model, *configured)))
-        return configured or self.selectable_models
-
-    @property
-    def default_web_model(self) -> str:
-        preferred = self.claude_model if self.runtime_backend in {"claude", "claude-cli"} else None
-        return preferred if preferred in self.selectable_models else self.selectable_models[0]
+    file_editor_max_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
+    file_upload_max_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
+    file_upload_max_files_per_session: int = Field(default=10, gt=0)
 
 
 @lru_cache

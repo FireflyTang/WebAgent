@@ -6,6 +6,7 @@ import asyncio
 import json
 import sqlite3
 import threading
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,36 @@ class SessionVersionConflictError(SessionRepositoryError):
 
 class SessionUiEventConflictError(SessionRepositoryError):
     """同一 UI event key 被赋予不同不可变 payload。"""
+
+
+@dataclass(frozen=True, slots=True)
+class UserRecord:
+    user_id: str
+    name: str
+    normalized_name: str
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedSettingsRecord:
+    values: Mapping[str, object]
+    version: int
+    updated_at: datetime
+
+
+def normalize_user_name(name: str) -> tuple[str, str]:
+    """Return the display and lookup forms for one administrator-created user."""
+
+    display_name = " ".join(unicodedata.normalize("NFKC", name).strip().split())
+    if not display_name:
+        raise ValueError("用户名称不能为空")
+    if len(display_name) > 80:
+        raise ValueError("用户名称不能超过 80 个字符")
+    if any(unicodedata.category(character).startswith("C") for character in display_name):
+        raise ValueError("用户名称不能包含控制字符")
+    return display_name, display_name.casefold()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +97,23 @@ class SessionRepository(Protocol):
         self, record: SessionRecord, *, expected_version: int | None = None
     ) -> SessionRecord: ...
 
-    async def list_sessions(self) -> list[SessionRecord]: ...
+    async def list_sessions(self, owner_user_id: str | None = None) -> list[SessionRecord]: ...
+
+    async def create_user(self, name: str) -> UserRecord: ...
+
+    async def get_user(self, user_id: str) -> UserRecord | None: ...
+
+    async def find_user_by_name(self, normalized_name: str) -> UserRecord | None: ...
+
+    async def list_users(self) -> list[UserRecord]: ...
+
+    async def set_user_enabled(self, user_id: str, enabled: bool) -> UserRecord: ...
+
+    async def get_managed_settings(self) -> ManagedSettingsRecord: ...
+
+    async def update_managed_settings(
+        self, values: Mapping[str, object], *, expected_version: int
+    ) -> ManagedSettingsRecord: ...
 
     async def list_due(
         self,
@@ -109,7 +156,7 @@ def _normalise_database_path(database: str | Path) -> tuple[str, bool]:
     if value == ":memory:":
         # A named shared in-memory database remains alive via an anchor
         # connection, while normal operations can still run in worker threads.
-        return f"file:openai_claude_sessions_{uuid4().hex}?mode=memory&cache=shared", True
+        return f"file:webagent_sessions_{uuid4().hex}?mode=memory&cache=shared", True
     return value, value.startswith("file:")
 
 
@@ -170,6 +217,7 @@ class SQLiteSessionRepository:
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
+                    owner_user_id TEXT NULL,
                     sandbox_id TEXT NULL,
                     claude_session_id TEXT NULL,
                     state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'PAUSED', 'DELETED')),
@@ -181,6 +229,13 @@ class SQLiteSessionRepository:
                     metadata_json TEXT NOT NULL
                 )
                 """
+            )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(sessions)")}
+            if "owner_user_id" not in columns:
+                connection.execute("ALTER TABLE sessions ADD COLUMN owner_user_id TEXT NULL")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS sessions_owner_idx "
+                "ON sessions (owner_user_id, last_activity_at)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS sessions_due_idx ON sessions (state, last_activity_at)"
@@ -220,6 +275,34 @@ class SQLiteSessionRepository:
                 "CREATE INDEX IF NOT EXISTS session_ui_events_session_idx "
                 "ON session_ui_events (session_id, insertion_sequence)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS managed_settings (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    values_json TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            now = _encode_timestamp(datetime.now(UTC))
+            connection.execute(
+                "INSERT OR IGNORE INTO managed_settings "
+                "(singleton, values_json, version, updated_at) VALUES (1, '{}', 0, ?)",
+                (now,),
+            )
 
     class _ConnectionContext:
         def __init__(self, repository: SQLiteSessionRepository) -> None:
@@ -258,9 +341,9 @@ class SQLiteSessionRepository:
                     connection.execute(
                         """
                         INSERT INTO sessions (
-                            session_id, sandbox_id, claude_session_id, state, created_at,
+                            session_id, owner_user_id, sandbox_id, claude_session_id, state, created_at,
                             last_activity_at, paused_at, deleted_at, version, metadata_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         values,
                     )
@@ -299,7 +382,7 @@ class SQLiteSessionRepository:
                 cursor = connection.execute(
                     """
                     UPDATE sessions SET
-                        sandbox_id = ?, claude_session_id = ?, state = ?, created_at = ?,
+                        owner_user_id = ?, sandbox_id = ?, claude_session_id = ?, state = ?, created_at = ?,
                         last_activity_at = ?, paused_at = ?, deleted_at = ?, version = ?,
                         metadata_json = ?
                     WHERE session_id = ? AND version = ?
@@ -314,6 +397,7 @@ class SQLiteSessionRepository:
                 raise
         return SessionRecord(
             session_id=record.session_id,
+            owner_user_id=record.owner_user_id,
             sandbox_id=record.sandbox_id,
             claude_session_id=record.claude_session_id,
             state=record.state,
@@ -369,18 +453,146 @@ class SQLiteSessionRepository:
         records = [self._from_row(row) for row in rows]
         return [record for record in records if record.metadata.get("cleanup_pending") is True]
 
-    async def list_sessions(self) -> list[SessionRecord]:
+    async def list_sessions(self, owner_user_id: str | None = None) -> list[SessionRecord]:
         """Return all durable sessions, newest activity first, including tombstones."""
 
         await self.initialize()
-        return await asyncio.to_thread(self._list_sessions_sync)
+        return await asyncio.to_thread(self._list_sessions_sync, owner_user_id)
 
-    def _list_sessions_sync(self) -> list[SessionRecord]:
+    def _list_sessions_sync(self, owner_user_id: str | None) -> list[SessionRecord]:
         with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM sessions ORDER BY last_activity_at DESC, session_id ASC"
-            ).fetchall()
+            if owner_user_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM sessions ORDER BY last_activity_at DESC, session_id ASC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM sessions WHERE owner_user_id = ? "
+                    "ORDER BY last_activity_at DESC, session_id ASC",
+                    (owner_user_id,),
+                ).fetchall()
         return [self._from_row(row) for row in rows]
+
+    async def create_user(self, name: str) -> UserRecord:
+        await self.initialize()
+        return await asyncio.to_thread(self._create_user_sync, name)
+
+    def _create_user_sync(self, name: str) -> UserRecord:
+        display_name, normalized = normalize_user_name(name)
+        now = datetime.now(UTC)
+        record = UserRecord(str(uuid4()), display_name, normalized, True, now, now)
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    "INSERT INTO users (user_id, name, normalized_name, enabled, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?)",
+                    (
+                        record.user_id,
+                        record.name,
+                        record.normalized_name,
+                        _encode_timestamp(now),
+                        _encode_timestamp(now),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise SessionAlreadyExistsError("用户名称已存在") from exc
+        return record
+
+    async def get_user(self, user_id: str) -> UserRecord | None:
+        await self.initialize()
+        return await asyncio.to_thread(self._get_user_sync, user_id)
+
+    def _get_user_sync(self, user_id: str) -> UserRecord | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return self._user_from_row(row) if row is not None else None
+
+    async def find_user_by_name(self, normalized_name: str) -> UserRecord | None:
+        await self.initialize()
+        return await asyncio.to_thread(self._find_user_by_name_sync, normalized_name)
+
+    def _find_user_by_name_sync(self, normalized_name: str) -> UserRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM users WHERE normalized_name = ?", (normalized_name,)
+            ).fetchone()
+        return self._user_from_row(row) if row is not None else None
+
+    async def list_users(self) -> list[UserRecord]:
+        await self.initialize()
+        return await asyncio.to_thread(self._list_users_sync)
+
+    def _list_users_sync(self) -> list[UserRecord]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT * FROM users ORDER BY created_at ASC").fetchall()
+        return [self._user_from_row(row) for row in rows]
+
+    async def set_user_enabled(self, user_id: str, enabled: bool) -> UserRecord:
+        await self.initialize()
+        return await asyncio.to_thread(self._set_user_enabled_sync, user_id, enabled)
+
+    def _set_user_enabled_sync(self, user_id: str, enabled: bool) -> UserRecord:
+        now = datetime.now(UTC)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE users SET enabled = ?, updated_at = ? WHERE user_id = ?",
+                (int(enabled), _encode_timestamp(now), user_id),
+            )
+            if cursor.rowcount != 1:
+                raise SessionRepositoryError("用户不存在")
+        record = self._get_user_sync(user_id)
+        assert record is not None
+        return record
+
+    async def get_managed_settings(self) -> ManagedSettingsRecord:
+        await self.initialize()
+        return await asyncio.to_thread(self._get_managed_settings_sync)
+
+    def _get_managed_settings_sync(self) -> ManagedSettingsRecord:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM managed_settings WHERE singleton = 1"
+            ).fetchone()
+        assert row is not None
+        return ManagedSettingsRecord(
+            values=json.loads(row["values_json"]),
+            version=row["version"],
+            updated_at=_decode_timestamp(row["updated_at"]),
+        )
+
+    async def update_managed_settings(
+        self, values: Mapping[str, object], *, expected_version: int
+    ) -> ManagedSettingsRecord:
+        await self.initialize()
+        return await asyncio.to_thread(
+            self._update_managed_settings_sync, dict(values), expected_version
+        )
+
+    def _update_managed_settings_sync(
+        self, values: Mapping[str, object], expected_version: int
+    ) -> ManagedSettingsRecord:
+        now = datetime.now(UTC)
+        encoded = json.dumps(dict(values), separators=(",", ":"), sort_keys=True)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE managed_settings SET values_json = ?, version = ?, updated_at = ? "
+                "WHERE singleton = 1 AND version = ?",
+                (encoded, expected_version + 1, _encode_timestamp(now), expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise SessionVersionConflictError("managed_settings")
+        return ManagedSettingsRecord(dict(values), expected_version + 1, now)
+
+    @staticmethod
+    def _user_from_row(row: sqlite3.Row) -> UserRecord:
+        return UserRecord(
+            user_id=row["user_id"],
+            name=row["name"],
+            normalized_name=row["normalized_name"],
+            enabled=bool(row["enabled"]),
+            created_at=_decode_timestamp(row["created_at"]),
+            updated_at=_decode_timestamp(row["updated_at"]),
+        )
 
     async def append_log_entry(
         self,
@@ -599,6 +811,7 @@ class SQLiteSessionRepository:
             raise ValueError("session metadata must be JSON serializable") from exc
         return (
             record.session_id,
+            record.owner_user_id,
             record.sandbox_id,
             record.claude_session_id,
             record.state.value,
@@ -614,6 +827,7 @@ class SQLiteSessionRepository:
     def _from_row(row: sqlite3.Row) -> SessionRecord:
         return SessionRecord(
             session_id=row["session_id"],
+            owner_user_id=row["owner_user_id"],
             sandbox_id=row["sandbox_id"],
             claude_session_id=row["claude_session_id"],
             state=SessionState(row["state"]),

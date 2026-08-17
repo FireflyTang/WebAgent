@@ -52,7 +52,7 @@ class Progress:
 
 @dataclass(frozen=True, slots=True)
 class Diagnostic:
-    """Structured provider diagnostics excluded from chat/WS/SSE but available to debug logs."""
+    """Structured provider diagnostics excluded from chat and WebSocket output, but kept in debug logs."""
 
     message_type: str
     subtype: str | None = None
@@ -66,6 +66,8 @@ class Diagnostic:
     parent_tool_use_id: str | None = None
     tool_input: dict[str, object] | None = None
     tool_result: str | dict[str, object] | list[dict[str, object]] | None = None
+    is_error: bool | None = None
+    result: str | None = None
     # Provider/runner supplied text which is safe to show to the user.  This
     # is deliberately distinct from thinking payloads: thinking is never
     # represented here and must remain unavailable to the debug transcript.

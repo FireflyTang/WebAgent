@@ -4,9 +4,9 @@
 
 > An unofficial, local-first coding-agent workspace — chat, run tools, inspect files, and keep several tasks moving at once.
 
-WebAgent turns a small FastAPI service and disposable Docker workers into a friendly browser workspace. Give an agent a task, watch real progress, switch to another session while it works, and come back to the result. It also includes a compact OpenAI-compatible API and a deterministic Fake runtime, so you can try the full session and streaming flow without buying model credits.
+WebAgent turns a small FastAPI service and disposable Docker workers into a friendly browser workspace. Give an agent a task, watch real progress, switch to another session while it works, and come back to the result.
 
-WebAgent is an **unofficial demo**, currently at **v0.3.0**. It is designed for one trusted user on a local machine—not as a hosted, multi-user service.
+WebAgent is an **unofficial demo**, currently at **v0.3.0**. It supports lightweight administrator-created user profiles for separating sessions, but names are not authentication credentials and the service is not a public multi-tenant system.
 
 ![WebAgent desktop workspace showing two coding tasks and a file tree](docs/assets/webagent-demo-desktop.png)
 
@@ -17,41 +17,29 @@ WebAgent is an **unofficial demo**, currently at **v0.3.0**. It is designed for 
 | What you can do | What happens |
 |---|---|
 | Keep coding conversations | Each session retains its transcript, agent context, model/effort choice, and workspace |
+| Organize sessions | Rename any session from its mouse or keyboard context menu, including while its task is running |
 | Work in parallel | Different sessions can run at the same time; each session still accepts one task at a time |
 | Leave and return | Closing the page does not cancel an application-owned task; reconnecting replays stored events and resumes live updates |
 | See honest progress | Steps, tool activity, duration, usage, completion, failure, and stop states come from runtime events—not guessed prose |
-| Handle project files | Upload files or folders, browse the workspace tree, and double-click a file to download it |
+| Handle project files | Upload files or folders, browse the workspace tree, and open UTF-8 text files with syntax highlighting; editing is enabled while the agent is idle |
 | Stop real work | Stop cancels the server-side stream and the command running inside the worker |
 | Bring a compatible provider | The web UI discovers model IDs from an Anthropic-compatible endpoint; it does not invent descriptions or recommendations |
-| Integrate with scripts | A small OpenAI Chat Completions-compatible streaming API is included |
 
 ![WebAgent narrow layout with the file drawer open](docs/assets/webagent-demo-narrow.png)
 
 *Illustrative narrow-screen demo · 中文 UI.*
 
-## Quick start: no provider required
+## Start the browser workspace
 
-You need Python 3.11+, [uv](https://docs.astral.sh/uv/), Docker, and curl.
+You need Python 3.11+, [uv](https://docs.astral.sh/uv/), Docker, and a browser.
 
 ```bash
 docker build -t webagent-worker:latest -f Dockerfile.worker .
 uv sync --locked
 cp .env.example .env
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-In another terminal:
-
-```bash
-curl http://127.0.0.1:8000/healthz
-./scripts/smoke_curl.sh
-```
-
-The example uses `FakeRuntime` and a Docker sandbox. This Fake curl path needs **no Provider endpoint or API key**: it creates a real session and workspace, streams a deterministic answer, writes calculator files, runs tests, continues the same session, and exercises lifecycle endpoints. If Docker is unavailable, `SANDBOX_BACKEND=local` is a lightweight development fallback; it separates directories but is not a security boundary.
-
-## Use the real web workspace
-
-The default Fake runtime remains fake even if the browser has Provider settings. For real agent work, first update `.env` and restart WebAgent:
+For browser tasks, edit `.env` before starting the service:
 
 ```env
 RUNTIME_BACKEND=claude
@@ -59,7 +47,19 @@ SANDBOX_BACKEND=docker
 DOCKER_NETWORK_MODE=host
 ```
 
-Then open <http://127.0.0.1:8000/>. The browser workflow intentionally requires a Provider:
+Then start the service and open <http://127.0.0.1:8000/>:
+
+```bash
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Open <http://127.0.0.1:8000/admin> first and create at least one user. A user enters that administrator-created name on the workspace welcome screen; a successful match opens only that user's sessions. The top-right account control provides logout. There is deliberately no registration, password, role, or permission system yet.
+
+The administrator monitor is intentionally operational rather than analytical. It keeps a bounded one-hour in-memory view of host, process, workspace, and managed-container load; reports SQLite, Docker, worker-image, UI-journal, and lifecycle-reaper health; and lists running/background tasks plus consistency or cleanup issues. It does not persist performance history, probe user Providers, or perform automatic repair.
+
+Sessions created before user ownership was introduced remain visible in the administrator table as unassigned and are intentionally hidden from named workspaces; this Demo does not perform legacy ownership migration. Saved Docker CPU, memory, and PID limits apply to newly created sandboxes after restart, not existing containers.
+
+The browser workflow intentionally requires a Provider:
 
 1. Open connection settings.
 2. Enter an **Anthropic-compatible** Endpoint, API Key, and authentication style (`Bearer` or `x-api-key`).
@@ -67,41 +67,15 @@ Then open <http://127.0.0.1:8000/>. The browser workflow intentionally requires 
 4. Choose the default model and effort, then select **Save settings**.
 5. Create a session, optionally upload a project, describe the change, and send.
 
-Provider settings stay in that browser and are attached to each web task. WebAgent does not copy the Provider configuration or key into session metadata, transcripts, or diagnostic SQLite. A Provider-catalog failure writes a server warning containing a sanitized endpoint, authentication mode, and a short key-hash fingerprint. If an agent or command prints a secret, raw diagnostics preserve that output. Changing a connection field invalidates the test result, so test and save again.
+Provider settings stay in that browser, are namespaced by the selected user, and are attached to each web task. WebAgent does not copy the Provider configuration or key into session metadata, transcripts, or diagnostic SQLite. A Provider-catalog failure writes a server warning containing a sanitized endpoint, authentication mode, and a short key-hash fingerprint. If an agent or command prints a secret, raw diagnostics preserve that output. Changing a connection field invalidates the test result, so test and save again.
+
+After a Provider is verified and saved, the browser performs a real catalog heartbeat every 15 seconds. The top-right badge reports that browser → WebAgent → Provider path even when no Session exists. A failure becomes **Connection interrupted** without discarding the saved catalog or defaults; recovery returns to **Connected** automatically. Session WebSockets reconnect independently and replay persisted events, so a temporary browser-network interruption does not cancel an application-owned turn.
 
 The model menu intentionally displays IDs only. Providers do not expose a universal, trustworthy format for model descriptions, prices, capabilities, or recommendations.
 
-For the OpenAI-compatible curl path, a real SDK runtime can additionally use optional deployment-level defaults:
+`RUNTIME_BACKEND=claude` runs the pinned Claude Agent SDK inside the worker. `claude-cli` remains an explicit compatibility fallback. Provider endpoint, credentials, authentication mode, and model come exclusively from the browser with each turn. WebAgent is provider-neutral; no model vendor or model ID is hard-coded into the product flow.
 
-```env
-RUNTIME_BACKEND=claude
-SANDBOX_BACKEND=docker
-CLAUDE_API_KEY=<your key>
-CLAUDE_BASE_URL=<anthropic-compatible base URL>
-CLAUDE_MODEL=<model ID returned by that provider>
-CLAUDE_AUTH_ENV=ANTHROPIC_API_KEY
-DOCKER_NETWORK_MODE=host
-```
-
-`RUNTIME_BACKEND=claude` runs the pinned Claude Agent SDK inside the worker. `claude-cli` remains an explicit compatibility fallback. WebAgent is provider-neutral; no model vendor or model ID is hard-coded into the product flow.
-
-## curl API example
-
-The API key below protects only the OpenAI-compatible endpoints; it is separate from a Provider key.
-
-```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Authorization: Bearer demo-local-key' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-ID: hello-webagent' \
-  -d '{
-    "model": "claude-code-agent",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Create a calculator with addition and run its tests"}]
-  }'
-```
-
-Reuse `X-Session-ID` for another turn. FakeRuntime recognizes calculator/addition, subtraction, `mock:write`, `mock:choice`, `permission`, `mock:slow`, and `mock:error` prompts.
+The example defaults to `RUNTIME_BACKEND=fake` for deterministic development and automated checks. It does not bypass the browser's Provider validation, so it is not a no-Provider browser task workflow. If Docker is unavailable, `SANDBOX_BACKEND=local` is a lightweight development fallback; it separates directories but is not a security boundary.
 
 ## How it fits together
 
@@ -109,10 +83,8 @@ Reuse `X-Session-ID` for another turn. FakeRuntime recognizes calculator/additio
 flowchart LR
     UI[React workspace] -->|REST: sessions, files, models| API[FastAPI]
     UI <-->|WebSocket subscription and control| Turns[Application-owned turns]
-    Curl[curl / OpenAI client] -->|Chat Completions + SSE| API
     API --> DB[(SQLite sessions, transcript, events, logs)]
     Turns --> Runtime[Fake or Agent SDK runtime]
-    API --> Runtime
     Runtime --> Worker[Per-session Docker worker]
     Worker <--> Files[Persistent workspace]
     Turns --> Journal[Ordered UI event journal]
@@ -123,9 +95,9 @@ The application—not the socket—owns a running web turn. A disconnected brows
 
 ## Logs and safety boundary
 
-The Session log is a troubleshooting view, not a sanitized activity feed. Depending on the runtime event, it can contain complete commands, arguments, tool output, file content, prompts, endpoint details, and error output. Treat logs, `data/`, uploaded workspaces, and databases as sensitive.
+The Session log is an ordered execution transcript with user input, Assistant output, tools, Bash commands, and tool results; low-level SDK events and raw JSON stay collapsed until needed. Common credential forms are masked, but this is not a general DLP system. Treat logs, `data/`, uploaded workspaces, and databases as sensitive.
 
-The web/session/file/log routes have **no user authentication or tenant isolation**. Docker workers reduce accidental host access but are not hardened for hostile code. Application settings default `HOST` to `127.0.0.1`, but Uvicorn's CLI does not read that setting as its own bind flag—keep the explicit `--host 127.0.0.1` shown above. Use only trusted projects and users, and place a real authentication proxy in front before exposing the service to any network. See [SECURITY.md](SECURITY.md).
+The name gate and session owner field provide product-level separation only; they are **not authentication or authorization**. Administrator APIs are also open. Docker workers reduce accidental host access but are not hardened for hostile code. Application settings default `HOST` to `127.0.0.1`, but Uvicorn's CLI does not read that setting as its own bind flag—keep the explicit `--host 127.0.0.1` shown above. Use only trusted projects and users, and place a real authentication proxy in front before exposing the service to any network. See [SECURITY.md](SECURITY.md).
 
 ## Development and verified status
 
@@ -149,16 +121,9 @@ uv run pytest -q -m integration tests/integration
 
 The basic Python suite, browser suite, and Docker integration suite are separate so a fresh machine has explicit prerequisites. Push and pull-request CI run the Python checks, frontend audit/tests/build, wheel build/install verification, and Chromium/WebKit browser tests. Docker integration is intentionally limited to manual workflow runs and published releases.
 
-Current v0.3.0 release evidence:
+Repository-owner `@codex` mentions can also answer discussions or prepare tested changes through a guarded repository-specific self-hosted runner. Public callers are denied unless explicitly allowlisted, and generated changes are never auto-merged. See [GitHub `@codex` collaboration](docs/CODEX_MENTIONS.md).
 
-- Python suite: **193 passed, 1 skipped, 1 warning**
-- Browser suite: **34 passed, 1 skipped** (including the narrow-screen settings entry)
-- Frontend protocol tests: **3 passed**
-- Docker integration tests: **5 passed** (including cross-UID workspace access)
-- `npm audit`: **0 vulnerabilities**
-- Fake/local curl smoke: **passed**
-
-The skipped test is a documented WebKit environment limitation; Chromium coverage passed. See [the current test matrix](docs/TEST_REPORT.md).
+Run the commands above in the target branch before release. The focused verification scope and environment limits are documented in [the test guide](docs/TEST_REPORT.md).
 
 ## Documentation
 
@@ -170,7 +135,8 @@ The skipped test is a documented WebKit environment limitation; Chromium coverag
 - [Test report](docs/TEST_REPORT.md)
 - [Changelog](docs/CHANGELOG.md)
 - [Security policy](SECURITY.md)
+- [GitHub `@codex` collaboration](docs/CODEX_MENTIONS.md)
 
 ## License
 
-[MIT](LICENSE). WebAgent is an unofficial project and is not affiliated with or endorsed by OpenAI or Anthropic.
+[MIT](LICENSE). WebAgent is an unofficial project and is not affiliated with or endorsed by any model provider.

@@ -1,0 +1,292 @@
+name: Codex mention assistant
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  codex:
+    if: >-
+      github.event.sender.type == 'User' &&
+      (
+        (github.event_name == 'issues' &&
+          (contains(github.event.issue.title, '@codex') ||
+           contains(github.event.issue.body, '@codex'))) ||
+        (github.event_name == 'pull_request_target' &&
+          (contains(github.event.pull_request.title, '@codex') ||
+           contains(github.event.pull_request.body, '@codex'))) ||
+        (github.event_name == 'issue_comment' &&
+          contains(github.event.comment.body, '@codex')) ||
+        (github.event_name == 'pull_request_review' &&
+          contains(github.event.review.body, '@codex')) ||
+        (github.event_name == 'pull_request_review_comment' &&
+          contains(github.event.comment.body, '@codex'))
+      )
+    runs-on: [self-hosted, linux, x64, codex-webagent]
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Check out trusted automation from the default branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .codex-automation
+          persist-credentials: false
+
+      - name: Authorize this mention
+        id: authorize
+        run: |
+          python3 .codex-automation/.github/scripts/codex_event.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --public-allowlist .codex-automation/.github/codex-public-allowlist.txt \
+            --authorize-only \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Explain public-repository permission denial
+        if: >-
+          steps.authorize.outputs.recognized == 'true' &&
+          steps.authorize.outputs.authorized != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.authorize.outputs.kind }}
+          NUMBER: ${{ steps.authorize.outputs.number }}
+          ACTOR: ${{ steps.authorize.outputs.actor }}
+        run: |
+          message="$RUNNER_TEMP/codex-permission-denied.md"
+          printf '%s\n\n%s\n\n%s\n' \
+            "⛔ @${ACTOR} 当前无权在这个公开仓库调用 @codex。" \
+            "公开仓库默认只允许仓库所有者；本次没有 checkout 目标代码，也没有启动 Codex。" \
+            "仓库所有者可在默认分支的 \`.github/codex-public-allowlist.txt\` 中每行添加一个 GitHub 用户名。" \
+            > "$message"
+          if [[ "$KIND" == "pull_request" ]]; then
+            gh pr comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$message"
+          else
+            gh issue comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$message"
+          fi
+
+      - name: Check out the current issue or pull request code
+        if: steps.authorize.outputs.authorized == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || (github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number)) || github.event.repository.default_branch }}
+          fetch-depth: 0
+          path: worktree
+          persist-credentials: false
+
+      - name: Normalize the mention and build repository context
+        id: prepare
+        if: steps.authorize.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_PROMPT_FILE: ${{ runner.temp }}/codex-mention-prompt.md
+          CODEX_SELECTION_INPUT_FILE: ${{ runner.temp }}/codex-current-instruction.txt
+        run: |
+          python3 .codex-automation/.github/scripts/codex_event.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo-dir "$GITHUB_WORKSPACE/worktree" \
+            --public-allowlist .codex-automation/.github/codex-public-allowlist.txt \
+            --prompt "$CODEX_PROMPT_FILE" \
+            --selection-input "$CODEX_SELECTION_INPUT_FILE" \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Create an isolated local working branch
+        id: branch
+        if: steps.authorize.outputs.authorized == 'true'
+        working-directory: worktree
+        env:
+          KIND: ${{ steps.prepare.outputs.kind }}
+          NUMBER: ${{ steps.prepare.outputs.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [[ "$KIND" == "issue" ]]; then
+            branch="codex/issue-${NUMBER}-${RUN_ID}"
+          else
+            branch="codex/pr-${NUMBER}-${RUN_ID}"
+          fi
+          git switch -c "$branch"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Run the repository's persistent Codex session
+        id: codex
+        if: steps.authorize.outputs.authorized == 'true'
+        continue-on-error: true
+        working-directory: worktree
+        env:
+          CODEX_HOME: ${{ vars.CODEX_HOME }}
+          CODEX_REPOSITORY: ${{ github.repository }}
+          CODEX_PROMPT_FILE: ${{ runner.temp }}/codex-mention-prompt.md
+          CODEX_SELECTION_INPUT_FILE: ${{ runner.temp }}/codex-current-instruction.txt
+          CODEX_OUTPUT_FILE: ${{ runner.temp }}/codex-final.md
+        run: ../.codex-automation/.github/scripts/run-repo-session.sh
+
+      - name: Detect code changes
+        id: patch
+        if: >-
+          always() && steps.authorize.outputs.authorized == 'true' &&
+          steps.prepare.outcome == 'success'
+        working-directory: worktree
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify changed code
+        id: verify
+        if: steps.codex.outcome == 'success' && steps.patch.outputs.changed == 'true'
+        continue-on-error: true
+        working-directory: worktree
+        run: |
+          uv sync --locked --dev
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run pytest -q -m "not integration" --ignore=tests/browser
+          npm --prefix frontend ci
+          npm --prefix frontend run check
+          uv run pytest -q tests/browser/test_web_demo_browser.py
+
+      - name: Publish the change
+        id: publish
+        if: >-
+          steps.codex.outcome == 'success' &&
+          steps.patch.outputs.changed == 'true' &&
+          steps.verify.outcome == 'success'
+        continue-on-error: true
+        working-directory: worktree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.prepare.outputs.kind }}
+          NUMBER: ${{ steps.prepare.outputs.number }}
+          BRANCH_NAME: ${{ steps.branch.outputs.name }}
+          HEAD_REF: ${{ steps.prepare.outputs.head_ref }}
+          HEAD_REPO: ${{ steps.prepare.outputs.head_repo }}
+          BASE_REF: ${{ steps.prepare.outputs.base_ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "Apply @codex request on #${NUMBER}"
+
+          askpass="$RUNNER_TEMP/git-askpass.sh"
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'case "$1" in' \
+            '  *Username*) printf "%s\\n" x-access-token ;;' \
+            '  *Password*) printf "%s\\n" "$GH_TOKEN" ;;' \
+            'esac' > "$askpass"
+          chmod 700 "$askpass"
+
+          if [[ "$KIND" == "issue" ]]; then
+            GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+              git push "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "HEAD:refs/heads/${BRANCH_NAME}"
+
+            body_file="$RUNNER_TEMP/codex-pr-body.md"
+            printf '%s\n\n%s\n' \
+              "Codex handled the explicit @codex request and verified the result." \
+              "Closes #${NUMBER}" > "$body_file"
+            pr_url=$(gh pr create \
+              --draft \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "$BASE_REF" \
+              --head "$BRANCH_NAME" \
+              --title "Apply @codex request from issue #${NUMBER}" \
+              --body-file "$body_file")
+            echo "result=pr" >> "$GITHUB_OUTPUT"
+            echo "url=$pr_url" >> "$GITHUB_OUTPUT"
+          else
+            if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" || -z "$HEAD_REF" ]]; then
+              echo "Cannot push an @codex change to cross-repository PR head: $HEAD_REPO" >&2
+              exit 3
+            fi
+            GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+              git push "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "HEAD:refs/heads/${HEAD_REF}"
+            echo "result=commit" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f "$askpass"
+
+      - name: Reply on GitHub
+        if: always() && steps.prepare.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.prepare.outputs.kind }}
+          NUMBER: ${{ steps.prepare.outputs.number }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          CHANGED: ${{ steps.patch.outputs.changed }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PUBLISH_RESULT: ${{ steps.publish.outputs.result }}
+          PUBLISH_URL: ${{ steps.publish.outputs.url }}
+          PUBLISH_SHA: ${{ steps.publish.outputs.sha }}
+          FINAL_FILE: ${{ runner.temp }}/codex-final.md
+          COMMENT_FILE: ${{ runner.temp }}/codex-comment.md
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          final_path = Path(os.environ["FINAL_FILE"])
+          final_text = final_path.read_text(encoding="utf-8").strip() if final_path.exists() else ""
+          if len(final_text) > 50_000:
+              final_text = final_text[:50_000] + "\n\n…（回复过长，已截断）"
+
+          outcome = os.environ["CODEX_OUTCOME"]
+          changed = os.environ.get("CHANGED") == "true"
+          verify = os.environ.get("VERIFY_OUTCOME", "")
+          publish = os.environ.get("PUBLISH_OUTCOME", "")
+          lines = ["## Codex 回复", "", final_text or "Codex 没有留下最终回复。", ""]
+
+          if outcome != "success":
+              lines += ["⚠️ Codex 执行失败，没有发布代码。", f"[查看运行日志]({os.environ['RUN_URL']})"]
+          elif not changed:
+              lines += ["ℹ️ 本次是讨论/分析回复，没有修改代码。"]
+          elif verify != "success":
+              lines += ["⚠️ Codex 生成了修改，但仓库验证失败，因此没有发布。", f"[查看运行日志]({os.environ['RUN_URL']})"]
+          elif publish != "success":
+              lines += ["⚠️ 修改通过验证，但发布失败。", f"[查看运行日志]({os.environ['RUN_URL']})"]
+          elif os.environ.get("PUBLISH_RESULT") == "pr":
+              lines += [f"✅ 修改已通过验证并创建 PR：{os.environ['PUBLISH_URL']}"]
+          else:
+              sha = os.environ.get("PUBLISH_SHA", "")[:12]
+              lines += [f"✅ 修改已通过验证并推送到当前 PR，commit `{sha}`。"]
+
+          lines += ["", "_由该仓库共享的本地 Codex 会话处理。_", ""]
+          Path(os.environ["COMMENT_FILE"]).write_text("\n".join(lines), encoding="utf-8")
+          PY
+
+          if [[ "$KIND" == "pull_request" ]]; then
+            gh pr comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$COMMENT_FILE"
+          else
+            gh issue comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$COMMENT_FILE"
+          fi
+
+      - name: Mark unsuccessful execution
+        if: >-
+          always() && steps.prepare.outcome == 'success' &&
+          (
+            steps.codex.outcome != 'success' ||
+            (steps.patch.outputs.changed == 'true' && steps.verify.outcome != 'success') ||
+            (steps.patch.outputs.changed == 'true' && steps.verify.outcome == 'success' &&
+             steps.publish.outcome != 'success')
+          )
+        run: exit 1

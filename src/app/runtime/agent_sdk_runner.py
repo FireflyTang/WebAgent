@@ -300,6 +300,7 @@ class EventMapper:
                     tool_name=name,
                     tool_use_id=block.tool_use_id,
                     parent_tool_use_id=parent_tool_use_id,
+                    is_error=is_error,
                     tool_result=block.content,
                 )
 
@@ -416,6 +417,8 @@ class EventMapper:
             usage=message.usage,
             duration_ms=message.duration_ms,
             duration_api_ms=message.duration_api_ms,
+            is_error=message.is_error,
+            result=message.result,
             **({"visible_text": visible_text} if visible_text else {}),
         )
         self._complete_open_phases(status="failed" if message.is_error else "completed")

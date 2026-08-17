@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -9,9 +10,10 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from starlette.requests import ClientDisconnect
+from starlette.responses import StreamingResponse
 
-from app.openai_compat.schemas import ChatCompletionRequest
-from app.openai_compat.sse import iter_openai_sse
+from app.api.sessions import _OpenedWorkspaceFileResponse
 from app.runtime.base import ProviderConfig, RuntimeContext
 from app.runtime.events import (
     Completed,
@@ -24,11 +26,14 @@ from app.runtime.events import (
 )
 from app.sandbox.local import LocalSandboxManager
 from app.sessions import SessionLockRegistry, SQLiteSessionRepository
-from app.sessions.models import SessionRecord, SessionState, utc_now
+from app.sessions.models import SessionRecord, SessionState, SessionTurnRequest, utc_now
 from app.sessions.reaper import LifecycleReaper
 from app.sessions.service import (
+    InvalidWorkspacePathError,
+    OpenedWorkspaceFile,
     SandboxUnavailableError,
     SessionBusyError,
+    SessionNotFoundError,
     SessionService,
     SessionTurnCompleted,
 )
@@ -197,7 +202,65 @@ class InspectFailsOnceSandbox(LocalSandboxManager):
 
 
 @pytest.mark.asyncio
-async def test_structured_stream_exposes_progress_summary_but_text_stream_stays_clean(
+async def test_workspace_reads_bypass_running_turn_lock_but_upload_stays_busy(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    locks = SessionLockRegistry()
+    sandbox = LocalSandboxManager(tmp_path / "workspaces")
+    service = SessionService(repository, locks, sandbox, ProgressRuntime())
+    record = await service.create_empty("running-files")
+    workspace = tmp_path / "workspaces" / (record.sandbox_id or "")
+    (workspace / "result.txt").write_text("partial result", encoding="utf-8")
+    lock = locks.lock_for("running-files")
+    await lock.acquire()
+    try:
+        assert await service.list_files("running-files") == [{"path": "result.txt", "size": 14}]
+        opened = await service.open_file("running-files", "result.txt")
+        assert opened.normalized_path == "result.txt"
+        assert b"".join([chunk async for chunk in opened.chunks()]) == b"partial result"
+        assert opened.closed
+        with pytest.raises(SessionBusyError, match="Cannot upload"):
+            await service.upload_files("running-files", [("new.txt", b"write")])
+    finally:
+        lock.release()
+        await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_scan_and_file_resolution_tolerate_disappearing_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    sandbox = LocalSandboxManager(tmp_path / "workspaces")
+    service = SessionService(repository, SessionLockRegistry(), sandbox, ProgressRuntime())
+    record = await service.create_empty("disappearing-files")
+    workspace = tmp_path / "workspaces" / (record.sandbox_id or "")
+    (workspace / "stable.txt").write_text("stable", encoding="utf-8")
+    vanishing = workspace / "vanishing.txt"
+    vanishing.write_text("gone", encoding="utf-8")
+    original_stat = Path.stat
+
+    def disappearing_stat(path: Path, *, follow_symlinks: bool = True):
+        if path == vanishing:
+            vanishing.unlink(missing_ok=True)
+            raise FileNotFoundError(vanishing)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", disappearing_stat)
+    assert await service.list_files("disappearing-files") == [{"path": "stable.txt", "size": 6}]
+    monkeypatch.setattr(Path, "stat", original_stat)
+
+    target = workspace / "read-race.txt"
+    target.write_text("gone soon", encoding="utf-8")
+    target.unlink()
+    with pytest.raises(SessionNotFoundError, match="does not exist"):
+        await service.open_file("disappearing-files", "read-race.txt")
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_open_workspace_file_stays_on_original_inode_after_path_replacement(
     tmp_path: Path,
 ) -> None:
     repository = SQLiteSessionRepository(tmp_path / "sessions.db")
@@ -207,9 +270,126 @@ async def test_structured_stream_exposes_progress_summary_but_text_stream_stays_
         LocalSandboxManager(tmp_path / "workspaces"),
         ProgressRuntime(),
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
+    record = await service.create_empty("inode-race")
+    workspace = tmp_path / "workspaces" / (record.sandbox_id or "")
+    target = workspace / "answer.txt"
+    target.write_bytes(b"validated inode")
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"host secret")
+
+    opened = await service.open_file("inode-race", "answer.txt")
+    target.unlink()
+    target.symlink_to(outside)
+
+    assert b"".join([chunk async for chunk in opened.chunks()]) == b"validated inode"
+    assert opened.closed
+    with pytest.raises(InvalidWorkspacePathError, match="symbolic links"):
+        await service.open_file("inode-race", "answer.txt")
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_open_workspace_file_rejects_hidden_and_directory_symlink_paths(
+    tmp_path: Path,
+) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    service = SessionService(
+        repository,
+        SessionLockRegistry(),
+        LocalSandboxManager(tmp_path / "workspaces"),
+        ProgressRuntime(),
     )
+    record = await service.create_empty("visible-files")
+    workspace = tmp_path / "workspaces" / (record.sandbox_id or "")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    (workspace / ".hidden").mkdir()
+    (workspace / ".hidden" / "secret.txt").write_text("hidden", encoding="utf-8")
+
+    with pytest.raises(InvalidWorkspacePathError, match="symbolic links"):
+        await service.open_file("visible-files", "escape/secret.txt")
+    with pytest.raises(InvalidWorkspacePathError, match="Invalid workspace path"):
+        await service.open_file("visible-files", ".hidden/secret.txt")
+    await repository.close()
+
+
+@pytest.mark.asyncio
+async def test_opened_workspace_file_closes_on_stream_cancel(tmp_path: Path) -> None:
+    path = tmp_path / "large.txt"
+    path.write_bytes(b"x" * (OpenedWorkspaceFile.chunk_size + 1))
+    opened = OpenedWorkspaceFile(os.open(path, os.O_RDONLY), "large.txt")
+    chunks = opened.chunks()
+
+    assert await anext(chunks) == b"x" * OpenedWorkspaceFile.chunk_size
+    await chunks.aclose()
+
+    assert opened.closed
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_response_closes_before_body_start_on_response_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "response.txt"
+    path.write_bytes(b"response")
+    opened = OpenedWorkspaceFile(os.open(path, os.O_RDONLY), "response.txt")
+    response = _OpenedWorkspaceFileResponse(
+        opened, media_type="text/plain", headers={"Content-Disposition": "inline"}
+    )
+
+    async def fail_before_stream(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("response setup failed")
+
+    monkeypatch.setattr(StreamingResponse, "__call__", fail_before_stream)
+    with pytest.raises(RuntimeError, match="response setup failed"):
+        await response({}, _unused_receive, _unused_send)
+
+    assert opened.closed
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_response_closes_on_client_disconnect(tmp_path: Path) -> None:
+    path = tmp_path / "disconnect.txt"
+    path.write_bytes(b"response")
+    opened = OpenedWorkspaceFile(os.open(path, os.O_RDONLY), "disconnect.txt")
+    response = _OpenedWorkspaceFileResponse(
+        opened, media_type="text/plain", headers={"Content-Disposition": "inline"}
+    )
+
+    async def disconnect_on_body(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body":
+            raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.4"}},
+            _unused_receive,
+            disconnect_on_body,
+        )
+
+    assert opened.closed
+
+
+async def _unused_receive() -> dict[str, object]:
+    return {"type": "http.disconnect"}
+
+
+async def _unused_send(_message: dict[str, object]) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_structured_stream_exposes_progress_and_terminal_summary(tmp_path: Path) -> None:
+    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
+    service = SessionService(
+        repository,
+        SessionLockRegistry(),
+        LocalSandboxManager(tmp_path / "workspaces"),
+        ProgressRuntime(),
+    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     structured = await service.stream_events(request, "progress-session")
     events = [event async for event in structured]
@@ -225,31 +405,6 @@ async def test_structured_stream_exposes_progress_summary_but_text_stream_stays_
     assert (done.input_tokens, done.output_tokens) == (3, 5)
     assert done.duration_seconds >= 0
 
-    text = await service.stream(request, "progress-session")
-    assert [chunk async for chunk in text] == ["visible answer"]
-    await repository.close()
-
-
-@pytest.mark.asyncio
-async def test_closing_text_stream_releases_session_lock(tmp_path: Path) -> None:
-    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
-    service = SessionService(
-        repository,
-        SessionLockRegistry(),
-        LocalSandboxManager(tmp_path / "workspaces"),
-        ProgressRuntime(),
-    )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
-
-    first = await service.stream(request, "early-close")
-    assert await anext(first) == "visible answer"
-    await first.aclose()
-
-    second = await service.stream(request, "early-close")
-    assert await anext(second) == "visible answer"
-    await second.aclose()
     await repository.close()
 
 
@@ -262,9 +417,7 @@ async def test_unstarted_structured_stream_owns_and_releases_session_lock(tmp_pa
         LocalSandboxManager(tmp_path / "workspaces"),
         ProgressRuntime(),
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     reserved = await service.stream_events(request, "never-started")
     with pytest.raises(SessionBusyError):
@@ -272,29 +425,6 @@ async def test_unstarted_structured_stream_owns_and_releases_session_lock(tmp_pa
     await reserved.aclose()
 
     next_turn = await service.stream_events(request, "never-started")
-    await next_turn.aclose()
-    await repository.close()
-
-
-@pytest.mark.asyncio
-async def test_sse_role_only_disconnect_releases_unstarted_text_stream_lock(tmp_path: Path) -> None:
-    repository = SQLiteSessionRepository(tmp_path / "sessions.db")
-    service = SessionService(
-        repository,
-        SessionLockRegistry(),
-        LocalSandboxManager(tmp_path / "workspaces"),
-        ProgressRuntime(),
-    )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
-
-    deltas = await service.stream(request, "sse-first-chunk")
-    response = iter_openai_sse(deltas, model="claude-code-agent")
-    assert b'"role":"assistant"' in await anext(response)
-    await response.aclose()
-
-    next_turn = await service.stream_events(request, "sse-first-chunk")
     await next_turn.aclose()
     await repository.close()
 
@@ -389,9 +519,7 @@ async def test_finalizer_failure_still_releases_session_lock_for_next_turn(tmp_p
         ProgressRuntime(),
         html_logger=FinalizingLogger(),  # type: ignore[arg-type]
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     first = await service.stream_events(request, "finalizer-lock")
     assert isinstance(await anext(first), Progress)
@@ -416,9 +544,7 @@ async def test_immediate_runtime_failure_is_not_completed_or_marked_resumable(
         LocalSandboxManager(tmp_path / "workspaces"),
         runtime,
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     first = await service.stream_events(request, "failed-before-session")
     events = [event async for event in first]
@@ -447,9 +573,7 @@ async def test_sqlite_log_failure_does_not_interrupt_a_turn(tmp_path: Path) -> N
         ProgressRuntime(),
         html_logger=FailingLogger(),  # type: ignore[arg-type]
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     stream = await service.stream_events(request, "log-write-failure")
     events = [event async for event in stream]
@@ -493,9 +617,7 @@ async def test_session_provider_is_turn_scoped_and_not_durable_metadata(tmp_path
         LocalSandboxManager(tmp_path / "workspaces"),
         runtime,
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
     first = ProviderConfig("https://first.example", "first-key", "ANTHROPIC_AUTH_TOKEN")
     second = ProviderConfig("https://second.example", "second-key", "ANTHROPIC_API_KEY")
 
@@ -526,9 +648,7 @@ async def test_session_effort_persists_and_next_resumed_turn_uses_patched_value(
         LocalSandboxManager(tmp_path / "workspaces"),
         runtime,
     )
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
 
     first = await service.stream_events(request, "effort-session", effort="medium")
     _ = [event async for event in first]
@@ -555,9 +675,7 @@ async def test_presentation_patch_retries_across_terminal_turn_update(tmp_path: 
         ProgressRuntime(),
     )
     await service.create_empty("racing-presentation", title="新会话")
-    request = ChatCompletionRequest(
-        model="claude-code-agent", messages=[{"role": "user", "content": "run"}], stream=True
-    )
+    request = SessionTurnRequest(message="run", model="test-model")
     original_update = repository.update
     final_update_ready = asyncio.Event()
     release_final_update = asyncio.Event()
@@ -605,22 +723,8 @@ async def test_rest_created_session_persists_first_system_prompt_for_later_turns
         runtime,
     )
     await service.create_empty("web-created")
-    first = ChatCompletionRequest(
-        model="claude-code-agent",
-        messages=[
-            {"role": "system", "content": "始终使用中文"},
-            {"role": "user", "content": "first"},
-        ],
-        stream=True,
-    )
-    second = ChatCompletionRequest(
-        model="claude-code-agent",
-        messages=[
-            {"role": "system", "content": "后续覆盖尝试"},
-            {"role": "user", "content": "second"},
-        ],
-        stream=True,
-    )
+    first = SessionTurnRequest(message="first", model="test-model", system_prompt="始终使用中文")
+    second = SessionTurnRequest(message="second", model="test-model", system_prompt="后续覆盖尝试")
 
     events = await service.stream_events(first, "web-created")
     _ = [event async for event in events]
@@ -658,6 +762,11 @@ async def test_reaper_immediately_retries_fresh_failed_tombstone_cleanup(tmp_pat
         service, pause_after_seconds=1, delete_after_seconds=2, interval_seconds=1
     )
     await reaper.tick()
+
+    diagnostics = reaper.diagnostics()
+    assert diagnostics["last_tick_at"] is not None
+    assert diagnostics["last_tick_completed_at"] is not None
+    assert diagnostics["last_error_at"] is None
 
     cleaned = await repository.get("cleanup-retry")
     assert cleaned is not None and cleaned.metadata["cleanup_pending"] is False

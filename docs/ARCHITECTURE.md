@@ -8,7 +8,6 @@
 flowchart TB
     Browser[React Web UI] -->|REST| FastAPI[FastAPI application]
     Browser <-->|per-session WebSocket| Registry[ActiveTurnRegistry]
-    Client[OpenAI-compatible client] -->|HTTP + SSE| FastAPI
     FastAPI --> Service[SessionService]
     Registry --> Service
     Service --> Runtime[Fake / Agent SDK / CLI fallback]
@@ -20,7 +19,17 @@ flowchart TB
     Repo --> Browser
 ```
 
-REST 负责 Session、Transcript、history、文件、诊断日志和 Provider model discovery。WebSocket 负责某个 Session 的 UI event 订阅、发起 web turn、ping 与 stop。OpenAI-compatible API 走独立的 Chat Completions/SSE 契约。
+REST 负责 Session、Transcript、history、文件、诊断日志和 Provider model discovery。WebSocket 负责某个 Session 的 UI event 订阅、发起 web turn、ping 与 stop。
+
+## 用户与后台管理
+
+SQLite 保存管理员预建的用户记录和 Session `owner_user_id`。工作台首次进入通过姓名查找启用用户，随后 REST 使用 `X-WebAgent-User-ID`、WebSocket `hello` 使用 `user_id`；服务端据此过滤 Session，并对跨用户 Session 返回不存在。Provider、默认模型和 effort 仍按用户命名空间保存在浏览器，不由后台托管。
+
+这不是安全认证：没有密码、Token、注册、角色或权限，后台接口也完全开放。无用户头的调用保留给本地后台和测试控制面。未来接入认证时，应替换统一身份依赖，而不是改变 Session owner 和传输边界。
+
+可管理运行参数保存在 SQLite `managed_settings` 中，并通过版本号做并发更新。后台同时展示当前运行值与保存值；保存值在下一次服务启动时合并进启动配置，页面不会自动重启服务。数据库位置、监听地址等引导应用启动的参数仍属于启动配置。
+
+已有 Docker 容器不会在启动时重新应用 CPU、内存或 PID 限制，因此这些资源参数只影响重启后新建的沙箱。旧数据库迁移只增加可空 owner 字段；未归属的旧 Session 保留在后台，但不出现在任何具名用户工作台。
 
 ## Session 与 workspace
 
@@ -76,7 +85,9 @@ Journal 不是持久任务队列。进程崩溃可能丢失尚未写入 SQLite �
 
 Web UI 把 Endpoint、API Key 与认证方式保存在浏览器，先调用 `/v1/web/models` 验证动态目录，再选择默认模型/effort并保存。每个 message 携带 Provider 配置快照；服务端按 turn 使用，不把配置或 Key 写入 Session metadata、Transcript 或 diagnostic SQLite。Provider 目录失败的 server warning 会使用脱敏 Endpoint、认证方式和 Key 短 hash fingerprint。模型目录只把 ID 视为稳定事实。
 
-Fake curl 路径无需 Provider。真实 Web UI 必须提供客户端 Provider。OpenAI-compatible API 可以使用服务端 `CLAUDE_*` 默认值，这两类 Key 与权限边界互不等同。
+保存后，浏览器每 15 秒调用一次 `/v1/web/models` 作为真实双链路心跳；该请求不复用跨请求目录缓存。Provider 健康状态与每个 Session 的 WebSocket 状态分离：前者驱动全局连接徽标，后者继续控制发送、停止、后台 turn 订阅和重连回放。心跳失败不删除已保存的目录或默认项，后续成功会自动恢复状态。
+
+Web UI 必须提供客户端 Provider。服务端按当前 turn 使用该配置，不将其转为部署级默认值。
 
 ## 三层历史
 
@@ -86,8 +97,8 @@ Fake curl 路径无需 Provider。真实 Web UI 必须提供客户端 Provider�
 | UI events | 恢复任务卡并衔接实时流 | step、activity、delta、usage、terminal 等协议事件 |
 | Diagnostic log | 深度排障 | SDK/工具/任务事件，可能含完整命令、参数、输出和文件内容 |
 
-三层不可互相替代。诊断日志并非脱敏视图，应视为敏感数据。应用不把 Provider 配置或 Key 复制到上述三类持久记录；目录失败的 server warning 另行记录脱敏 Endpoint、auth mode 与短 hash fingerprint。Agent/命令自行打印的 Secret 会随 raw 输出持久化；thinking 正文不作为产品进度展示。
+三层不可互相替代。诊断日志会遮罩常见 Provider/API key、Authorization、token 和 Cookie 形式，但并非通用 DLP，仍应视为敏感数据。应用不把 Provider 配置或 Key 复制到上述三类持久记录；目录失败的 server warning 另行记录脱敏 Endpoint、auth mode 与短 hash fingerprint。thinking 正文不作为产品进度展示。
 
 ## 部署边界
 
-当前只支持单 Uvicorn worker。锁、active turn、pending journal 与订阅均为进程内状态；多 worker 或多实例需要数据库租约、所有权和跨实例事件分发。默认监听 `127.0.0.1`，网页没有用户身份或租户授权，不应直接暴露到不可信网络。
+当前只支持单 Uvicorn worker。锁、active turn、pending journal 与订阅均为进程内状态；多 worker 或多实例需要数据库租约、所有权和跨实例事件分发。默认监听 `127.0.0.1`；当前只有姓名分流而没有身份认证或租户授权，不应直接暴露到不可信网络。
