@@ -51,6 +51,34 @@ runner 的实际 Codex home 通过 GitHub Actions repository variable `CODEX_HOM
 
 目标 checkout / worktree 是一次性的；上面的 Session ID 才是跨 Issue / PR mention 延续上下文的状态。重大重构、连续误解或大约 10–20 个实质请求后，应在没有 job 运行时归档旧 Session ID，再开始新会话。
 
+## 服务运维
+
+仓库没有固定 runner 的主机实例名。先在 runner 主机上查找 WebAgent 仓库对应的 systemd unit，再把输出中的完整名称填入 `RUNNER_UNIT`：
+
+```bash
+systemctl list-unit-files --type=service --no-legend \
+  'actions.runner.FireflyTang-WebAgent.*.service'
+RUNNER_UNIT='<上一步输出的完整 unit 名称>'
+sudo systemctl status "$RUNNER_UNIT"
+sudo journalctl -u "$RUNNER_UNIT" -n 100 --no-pager
+```
+
+确认没有相关 job 正在运行后，可重启并检查服务是否恢复：
+
+```bash
+sudo systemctl restart "$RUNNER_UNIT"
+systemctl is-active "$RUNNER_UNIT"
+```
+
+随后在 GitHub 仓库的 **Settings → Actions → Runners** 中确认带 `codex-webagent` 标签的 runner 状态为 **Idle** 或 **Active**（即在线）。也可使用 GitHub CLI 查看 `status`、`busy` 和标签：
+
+```bash
+gh api 'repos/FireflyTang/WebAgent/actions/runners?per_page=100' \
+  --jq '.runners[] | select(any(.labels[]; .name == "codex-webagent")) | {name, status, busy, labels: [.labels[].name]}'
+```
+
+匹配项的 `status` 应为 `online`；`busy: true` 只表示正在执行 job。若发现命令返回多个 unit 或多个匹配 runner，应先核对实例，而不是批量重启。
+
 ## 仓库内实现
 
 - [`.github/workflows/codex-mention.yml`](../.github/workflows/codex-mention.yml)：触发、授权、checkout、验证、发布和回复。
